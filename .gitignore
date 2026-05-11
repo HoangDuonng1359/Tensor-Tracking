@@ -2,6 +2,8 @@
 data/
 outputs/
 logs/
+!/**/.gitkeep
+!data/README.md
 *.npy
 *.mat
 *.csv
