@@ -1,4 +1,4 @@
-# Exploratory Data Analysis (EDA) Documentation (Cập nhật 40 Subjects)
+# Exploratory Data Analysis (EDA) Documentation
 ## 🧠 Project: TrackingTensor3D (ERN Component - Flanker Task)
 
 Tài liệu này tóm tắt quá trình Khám phá Dữ liệu (EDA) chi tiết cho toàn bộ **40 đối tượng** trong bộ dữ liệu EEG thuộc dự án **TrackingTensor3D**, dựa trên nghiên cứu của Ozdemir (2017) và bộ dữ liệu **ERP CORE**.
@@ -6,62 +6,46 @@ Tài liệu này tóm tắt quá trình Khám phá Dữ liệu (EDA) chi tiết 
 ---
 
 ## 1. Tổng quan về Bộ dữ liệu (Dataset Overview)
-- **Tổng số đối tượng**: 40 người trưởng thành (neurotypical).
+- **Tổng số đối tượng**: 40 người trưởng thành.
 - **Nhiệm vụ**: **Flanker Task** (Nghiên cứu về Error-Related Negativity - ERN).
-- **Thiết bị**: EEG 30 kênh, tốc độ lấy mẫu (SFREQ) 128 Hz.
-- **Mục tiêu**: Phân tích sự thay đổi động của mạng lưới não bộ khi người dùng mắc lỗi (Incorrect) so với khi làm đúng (Correct).
+- **Thiết bị**: EEG 30 kênh, tốc độ lấy mẫu 128 Hz.
+- **Mục tiêu**: Phân tích sự thay đổi động của mạng lưới não bộ khi mắc lỗi (Incorrect) so với khi làm đúng (Correct).
 
 ---
 
 ## 2. Thống kê Chi tiết về Thử nghiệm (Trial Statistics)
-Sau khi chạy xử lý cho toàn bộ 40 người, chúng ta có các con số thống kê quan trọng về phân bổ thử nghiệm:
+
+Dựa trên kết quả chạy pipeline mới nhất cho 40 subjects:
 
 ### A. Thử nghiệm Đúng (Correct Trials)
-- **Trung bình**: **355.73** trials/người.
-- **Thấp nhất (Min)**: 249 trials (`sub-006`).
-- **Cao nhất (Max)**: 398 trials (`sub-005`).
-- **Nhận xét**: Số lượng trial Đúng rất dồi dào và ổn định trên tất cả các đối tượng, cung cấp một "baseline" (CRN) mạnh mẽ cho việc so sánh.
+- **Đặc điểm**: Số lượng trial Đúng dồi dào (~250-400 trials/người), cung cấp baseline ổn định.
 
 ### B. Thử nghiệm Sai (Incorrect Trials - ERN)
-- **Trung bình**: **45.42** trials/người.
-- **Thấp nhất (Min)**: 2 trials (`sub-005`).
-- **Cao nhất (Max)**: 138 trials (`sub-006`).
-- **Nhận xét**: Đây là biến số quan trọng nhất. Vì ERN là phản ứng tự nhiên khi mắc lỗi, số lượng trial này phụ thuộc hoàn toàn vào hiệu suất của người tham gia.
-
-### C. Tiêu chuẩn Sàng lọc (Inclusion Criteria)
-Dựa trên bài báo Ozdemir, các đối tượng cần có tối thiểu **15 trials lỗi** để đảm bảo tính ổn định của Tensor kết nối.
-- **Số lượng đạt chuẩn**: **34/40** người (85%).
-- **Số lượng bị loại**: **6** người (`sub-005, 007, 009, 014, 019, 020`).
-- **Lý do loại**: Quá ít lỗi (dưới 15 câu), dẫn đến việc tính toán PLV (Phase Locking Value) không đạt độ tin cậy thống kê.
+- **Đặc điểm**: Số lượng trial biến thiên lớn tùy theo hiệu suất người tham gia (từ 1 đến 138 trials).
+- **Cập nhật Inclusion Criteria**: Theo yêu cầu mới, **tất cả 40 subjects** đều được đưa vào phân tích (bao gồm cả các sub có ít hơn 15 lỗi) để tối đa hóa kích thước mẫu. 
 
 ---
 
-## 3. Bảng phân bổ Thử nghiệm (Mẫu 10 người đầu tiên)
+## 3. Quy trình xử lý Artifacts & Tín hiệu
 
-| Subject | Status | Correct | Incorrect | Result |
-| :--- | :--- | :--- | :--- | :--- |
-| **sub-001** | SUCCESS | 346 | 56 | Included |
-| **sub-002** | SUCCESS | 384 | 18 | Included |
-| **sub-003** | SUCCESS | 356 | 43 | Included |
-| **sub-004** | SUCCESS | 330 | 71 | Included |
-| **sub-005** | SUCCESS | 398 | 2 | **Excluded (<15)** |
-| **sub-006** | SUCCESS | 249 | 138 | Included (Most Errors) |
-| **sub-007** | SUCCESS | 388 | 14 | **Excluded (<15)** |
-| **sub-008** | SUCCESS | 351 | 52 | Included |
-| **sub-009** | SUCCESS | 394 | 8 | **Excluded (<15)** |
-| **sub-010** | SUCCESS | 325 | 76 | Included |
+1. **CSD (Current Source Density)**: Thay thế hoàn toàn cho ICA để bảo toàn pha tín hiệu. Giúp giảm nhiễu Volume Conduction và làm nổi bật các nguồn phát tại FCz/Cz.
+2. **Temporal Matching**: Thay vì lấy ngẫu nhiên, chúng ta khớp các trial Đúng gần nhất với thời điểm xảy ra trial Sai để triệt tiêu ảnh hưởng của sự mệt mỏi hoặc trôi tín hiệu sinh học.
+3. **Theta Enhancement**: Phân tích PSD xác nhận năng lượng Theta (4-8Hz) tăng mạnh trong cửa sổ 0-150ms sau phản ứng sai.
 
 ---
 
-## 4. Chất lượng Tín hiệu và Hình ảnh hóa
-- **Nhiễu mắt (Ocular Artifacts)**: Xuất hiện ở 100% đối tượng tại các kênh `Fp1`, `Fp2`. Đã được xử lý triệt để bằng ICA.
-- **Dải tần Theta (4-8Hz)**: Qua phân tích PSD, dải Theta cho thấy năng lượng tăng vọt rõ rệt trong các trial lỗi (Incorrect) so với trial đúng.
-- **ERN Waveform**: Đỉnh âm (negative peak) được ghi nhận rõ ràng nhất tại kênh **FCz** trong khoảng **25ms - 100ms** sau khi nhấn nút sai.
+## 4. Danh sách Subjects & Trạng thái
+
+| Subject | Status | Incorrect Trials | Decision |
+| :--- | :--- | :--- | :--- |
+| **sub-001** | SUCCESS | 56 | Included |
+| **sub-005** | SUCCESS | 2 | Included (Low trial count) |
+| **sub-006** | SUCCESS | 138 | Included (High trial count) |
+| **sub-040** | SUCCESS | 28 | Included |
+| ... | ... | ... | ... |
 
 ---
 
 ## 5. Kết luận EDA
-Bộ dữ liệu sau khi xử lý 40 người đã cho thấy một mẫu đủ lớn (**n=34**) để tiến hành các phân tích Tensor chuyên sâu. Sự chênh lệch giữa số lượng Correct và Incorrect được giải quyết bằng kỹ thuật **Trial Balancing** (lấy ngẫu nhiên số lượng trial Correct bằng đúng số lượng Incorrect của từng người) trước khi đưa vào tính toán Tensor.
+Việc bao gồm toàn bộ 40 subjects giúp tăng cường sức mạnh cho các phân tích cụm (FCCA). Sự chênh lệch trial được xử lý triệt để bằng **Temporal Matching Subsampling**, đảm bảo mỗi subject đóng góp một cặp tensor Đúng/Sai có kích thước tương đương và trạng thái sinh học tương đồng.
 
----
-*Tài liệu được cập nhật tự động bởi Antigravity Coding Assistant (04/05/2026).*

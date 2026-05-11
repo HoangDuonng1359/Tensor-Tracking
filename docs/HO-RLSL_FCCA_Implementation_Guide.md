@@ -1,56 +1,61 @@
 # HO-RLSL Subspace Tracking & FCCA Implementation Guide
 
-This document outlines the technical implementation and alignment of the High-Order Recursive Least Squares Subspace (HO-RLSL) tracking and Fiedler Consensus Clustering Algorithm (FCCA) within the `TrackingTensor3D` project, based on the framework by **Ozdemir et al. (2017)**.
+This document outlines the technical implementation of the High-Order Recursive Least Squares Subspace (HO-RLSL) tracking and Fiedler Consensus Clustering Algorithm (FCCA) within the **TrackingTensor3D** project, based on **Ozdemir et al. (2017)**.
 
 ---
 
-## 1. HO-RLSL Subspace Tracking
+## 1. HO-RLSL Subspace Tracking (`algorithms/ho_rlsl.py`)
 
-### 1.1 Initialization (Baseline Training)
-To ensure stability and eliminate artifactual change-points during the pre-stimulus period, the system implements a dedicated training phase:
-- **Duration:** 1000ms (128 samples at 128Hz).
-- **Method:** HOSVD (Higher-Order SVD) is performed on the baseline tensor to initialize the spatial basis $U$ (Channels) and subject basis $V$ (Subjects).
-- **Adaptive Thresholding:** An initial `sigma_min` is estimated from the baseline singular values to anchor the tracking sensitivity.
+The HO-RLSL engine tracks the non-stationary dynamics of the EEG connectivity tensor.
 
-### 1.2 Online Recursive Update
-The core engine updates the subspace every $\alpha = 8$ samples (approx. 62.5ms), as recommended for EEG connectivity dynamics:
-- **Windowing:** A sliding window of size $\alpha$ captures the most recent "clean" low-rank signal.
-- **Orthogonal Projection:** Data is projected onto the complement of the current subspace: $D_{proj} = (I - UU^T) D_{window}$.
-- **Basis Expansion:** If the energy in $D_{proj}$ exceeds a threshold $\sigma_{min}$, new directions are added to $U$.
-- **Rank Constraint:** The updated basis is truncated back to rank $r=5$ using SVD to maintain a parsimonious representation.
-
-### 1.3 Change-Point Detection
-Change-points are identified directly from **Basis Reconfigurations**:
-- A change-point is triggered if the HO-RLSL algorithm adds or removes directions from the subspace.
-- **Tuning:** For this PLV dataset (34 subjects, 30 channels), the optimal sensitivity was found at $\sigma_{min} = 0.063$. This filters out noise jitter while capturing significant transitions during the ERN (50-250ms).
+### 1.1 Key Functions
+- `initialize_tucker_subspace()`: Performs HOSVD on the baseline tensor (-1000ms to 0ms) to create the initial spatial ($U$) and subject ($V$) bases.
+- `update_recursive_subspace()`: The core online update step. It projects new data onto the orthogonal complement of $U$ and identifies novel directions using an adaptive threshold ($\sigma_{min}$).
+- `extract_sparse_components()`: Uses ISTA ($L_1$ minimization) to isolate sparse noise and artifacts from the low-rank neural signal.
+- `decompose_tensor_stream()`: The main loop that iterates through time, managing subspace velocity calculation and change-point detection.
 
 ---
 
-## 2. FCCA (Fiedler Consensus Clustering)
+## 2. FCCA (Fiedler Consensus Clustering) (`fcca/`)
 
-The FCCA module provides a group-level consensus on the brain's functional communities during the task period.
+FCCA identifies stable functional communities at the group level by aggregating individual subspace reconfigurations.
 
-### 2.1 Mathematical Procedure
-1. **Laplacian Construction:** For each subject and time point, the Laplacian $L = D - A$ is computed from the low-rank connectivity matrix.
-2. **Fiedler Vector:** The eigenvector corresponding to the second smallest eigenvalue of $L$ is extracted.
-3. **Bi-partitioning:** Nodes are assigned to two clusters (A or B) based on the sign of their Fiedler vector components.
-4. **Consensus Matrix ($W$):** A co-occurrence matrix tracks how often pairs of nodes share the same cluster across all subjects and time points.
-5. **Final Clustering:** A final Fiedler decomposition is performed on the averaged $W$ to determine the global consensus topology.
-
-### 2.2 Functional Interpretation
-In the current ERP task (ERN/CRN):
-- **Cluster A (Frontal-Central):** Acts as the "Executive Hub" (including FCz, Cz, Fz), responsible for error monitoring.
-- **Cluster B (Posterior-Parietal):** Acts as the "Sensory Hub" (including Oz, Pz, PO8), responsible for feedback processing.
+### 2.1 Methodology
+1. **Consensus Matrix Computation**: `compute_consensus_clusters()` in `fcca/consensus.py` builds a co-occurrence matrix $W$ across all subjects and time windows.
+2. **Spectral Partitioning**: Nodes are assigned to clusters based on the sign of the Fiedler vector (derived from the Laplacian of $W$).
+3. **Dynamic Assessment**: `fcca/dynamics.py` compares the consensus topology between Baseline and ERN periods to quantify network integration/segregation.
 
 ---
 
-## 3. Ozdemir (2017) Alignment Summary
+## 3. Workflow & Execution
 
-- **Alpha Parameter:** Set to 8 samples (Matched).
-- **Initialization:** Full 1s Baseline Training (Matched).
-- **Subspace Velocity:** Derived from the Frobenius norm of projection changes (Matched).
-- **Sparse Recovery:** $L_1$-norm regularization used to isolate transient connectivity artifacts (Matched).
-- **Topology:** Hubs identified at Medial-Frontal regions during ERN peaks (Matched).
+To replicate the analysis, follow these steps in order:
+
+### A. Tensor Decomposition
+```bash
+python3 -m algorithms.ho_rlsl
+```
+- Input: `connectivity/tensor_incorrect_4d.npy`
+- Output: Low-rank tensors and detected change-points (`horls_*.npy`).
+
+### B. Group Consensus Clustering
+```bash
+python3 -m fcca.consensus
+```
+- Identifies global functional communities during the ERN window (0-150ms).
+
+### C. Dynamic Network Comparison
+```bash
+python3 -m fcca.dynamics
+```
+- Compares Pre-Response vs. Post-Response network states.
 
 ---
-*Developed as part of the TrackingTensor3D Research Pipeline.*
+
+## 4. Parameter Standards (Ozdemir 2017)
+
+- **Rank ($r$):** 5 (Captures ~85% variance in connectivity).
+- **Update Window ($\alpha$):** 8 samples (62.5ms).
+- **Sensitivity ($\sigma_{min}$):** 0.063 (Calibrated for ERN detection).
+- **Band:** Theta (4-8 Hz).
+

@@ -1,9 +1,12 @@
-# Data and Outputs
+# --- Data and Results (CRITICAL) ---
 data/
 outputs/
 logs/
+*.npy
+*.mat
+*.csv
 
-# EEG Data Formats
+# --- EEG Binary Formats ---
 *.set
 *.fdt
 *.fif
@@ -13,7 +16,16 @@ logs/
 *.vmrk
 *.eeg
 
-# Images and Reports (Except Markdown)
+# --- Python Environment ---
+__pycache__/
+*.py[cod]
+*$py.class
+venv/
+env/
+.venv/
+.env
+
+# --- Visualization and Reports ---
 *.png
 *.jpg
 *.jpeg
@@ -21,19 +33,12 @@ logs/
 *.svg
 *.html
 
-# Python environment and Temp
-__pycache__/
-*.py[cod]
-*$py.class
-.venv/
-env/
-venv/
-.env
-
-# Jupyter Notebook checkpoints
-.ipynb_checkpoints/
-
-# IDE settings
+# --- IDE and System Files ---
 .vscode/
 .idea/
 .DS_Store
+*.swp
+*.swo
+
+# --- Jupyter Notebook ---
+.ipynb_checkpoints/

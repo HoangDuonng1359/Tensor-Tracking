@@ -1,56 +1,55 @@
-# Quy trình Xây dựng Tensor 3D và Phân tích Kết nối (Cập nhật 34 Subjects)
+# Quy trình Xây dựng Tensor và Phân tích Kết nối
 ## 🧠 Dựa trên phương pháp Ozdemir (2017)
 
-Sau khi tiền xử lý, dữ liệu EEG sạch được chuyển đổi thành các Tensor 3D để đại diện cho sự thay đổi của mạng lưới kết nối não bộ theo thời gian.
+Sau khi tiền xử lý, dữ liệu EEG sạch được chuyển đổi thành các Tensor 4D đại diện cho sự thay đổi của mạng lưới kết nối não bộ theo thời gian.
 
 ---
 
-## 1. Cơ sở lý thuyết: Phân tích Kết nối (Connectivity)
-Mạng lưới não bộ không chỉ được xác định bởi biên độ tín hiệu tại một điểm, mà bởi sự **đồng bộ pha** giữa các vùng não khác nhau. 
+## 1. Cơ sở lý thuyết: Kết nối Pha (Phase Connectivity)
+
+Mạng lưới não bộ trong nghiên cứu này được xác định bởi sự **đồng bộ pha** giữa các vùng não thay vì biên độ tín hiệu đơn thuần.
 
 ### Kỹ thuật Ước lượng Pha: RID-Rihaczek
-Dự án sử dụng **Reduced Interference Rihaczek Distribution (RID-Rihaczek)** để ước lượng pha tức thời của tín hiệu EEG trong miền thời gian-tần số.
-- **Ưu điểm**: Độ phân giải thời gian-tần số cực cao, giảm thiểu nhiễu chéo (cross-terms) so với các phương pháp truyền thống như Wigner-Ville hay Wavelet.
-- **Dải tần**: Tập trung vào dải **Theta (4-8 Hz)** – dải tần số đặc trưng cho các quá trình kiểm soát nhận thức và phát hiện lỗi trong não bộ.
+Dự án sử dụng **Reduced Interference Rihaczek Distribution (RID-Rihaczek)** để ước lượng pha tức thời:
+- **Dải tần**: Tập trung vào dải **Theta (4-8 Hz)**.
+- **Mã nguồn**: Thực thi tại hàm `compute_rid_rihaczek_tfd()` trong `preprocessing/connectivity.py`.
 
 ---
 
 ## 2. Chỉ số Kết nối: PLV (Phase Locking Value)
+
 Để đo lường sự kết nối giữa hai kênh EEG (nút mạng), dự án sử dụng **Phase Locking Value (PLV)**:
-- **Ý nghĩa**: Đo lường mức độ ổn định của sự lệch pha giữa hai tín hiệu trên nhiều thử nghiệm (trials).
-- **Giá trị**: Từ 0 (hoàn toàn không đồng bộ) đến 1 (đồng bộ hoàn hảo).
-- **Công thức**: $PLV_{i,j}(t) = \frac{1}{K} |\sum_{k=1}^{K} e^{j(\phi_i^k(t) - \phi_j^k(t))}|$ (với $K$ là số lượng trial).
+- **Giá trị**: Từ 0 (không đồng bộ) đến 1 (đồng bộ hoàn hảo).
+- **GPU Acceleration**: Tính toán PLV được tăng tốc bằng GPU (PyTorch) để xử lý khối lượng dữ liệu lớn của 40 subjects.
 
 ---
 
-## 3. Cấu trúc Tensor 3D/4D sau cùng
-Dữ liệu từ **34 đối tượng** đã được tổng hợp thành một khối Tensor lớn:
+## 3. Cấu trúc Tensor 4D sau cùng
+
+Dữ liệu từ **40 đối tượng** được tổng hợp thành các khối Tensor:
 
 ### Tensor tổng hợp (4D):
-- **Kích thước**: `(34, 30, 30, 256)`
-    - `34`: Số lượng người tham gia đạt tiêu chuẩn (>15 lỗi).
-    - `30 x 30`: Ma trận kết nối đầy đủ giữa tất cả các cặp kênh EEG.
-    - `256`: Các mốc thời gian (từ -1.0s đến 1.0s, tương ứng 128Hz).
+- **Kích thước**: `(40, 30, 30, 256)`
+    - `40`: Số lượng người tham gia (bao gồm toàn bộ dataset).
+    - `30 x 30`: Ma trận kết nối giữa các cặp kênh.
+    - `256`: Các mốc thời gian (tương ứng 2 giây tại 128Hz).
 
 ---
 
-## 4. Quy trình thực hiện (Pipeline)
-1. **Cân bằng Trial (Trial Balancing)**: 
-    - Vì số lượng Correct >> Incorrect, chúng ta thực hiện lấy mẫu ngẫu nhiên (Random Subsampling) các trial Correct để có tỉ lệ 1:1. 
-    - Điều này đảm bảo giá trị PLV không bị thiên kiến do số lượng mẫu khác nhau.
-2. **GPU Acceleration**: 
-    - Sử dụng **PyTorch** để tính toán RID-Rihaczek trên GPU. 
-    - Việc tính toán 30x30 ma trận PLV cho 256 thời điểm x 34 người là cực kỳ nặng nề, GPU giúp giảm thời gian từ vài giờ xuống còn vài phút.
+## 4. Quy trình thực hiện (`preprocessing/connectivity.py`)
+
+1. **Temporal Matching**: 
+   - Thay vì lấy mẫu ngẫu nhiên, hệ thống sử dụng hàm `match_temporal_trials()` để chọn các trial Đúng có thời gian gần nhất với trial Sai. 
+   - Điều này giúp triệt tiêu nhiễu do mệt mỏi hoặc drift tín hiệu qua thời gian.
+2. **Batch Processing**: 
+   - Pipeline tự động duyệt qua 40 subjects, tính toán ma trận PLV cho từng người và stack chúng thành Tensor 4D.
 3. **Lưu trữ**: 
-    - `tensor_correct_4d.npy` (~30MB)
-    - `tensor_incorrect_4d.npy` (~30MB)
+   - Kết quả được lưu dưới dạng `.npy` để tối ưu hóa việc đọc/ghi trong Python và `.mat` để phục vụ kiểm chứng bằng MATLAB nếu cần.
 
 ---
 
-## 5. Ý nghĩa của Tensor trong bài báo Ozdemir
-Việc xây dựng Tensor này cho phép chúng ta áp dụng các thuật toán **Recursive Tensor Subspace Tracking (HO-RLSL)**. Thay vì nhìn vào từng ma trận kết nối riêng lẻ, thuật toán sẽ nhìn vào toàn bộ khối dữ liệu để tìm ra:
-- **Cấu trúc cộng đồng ổn định**: Các vùng não thường xuyên "nói chuyện" với nhau.
-- **Điểm thay đổi động (Change-points)**: Thời điểm chính xác mà mạng lưới não bộ tái cấu trúc để phản ứng với lỗi lầm.
+## 5. Ứng dụng trong HO-RLSL
+Khối Tensor 4D này là đầu vào trực tiếp cho thuật toán `decompose_tensor_stream()` trong `algorithms/ho_rlsl.py`. Nó cho phép theo dõi sự tiến hóa của "Common Subspace" – đại diện cho cấu trúc mạng lưới dùng chung giữa tất cả các subjects.
 
 ---
-*Tài liệu được cập nhật dựa trên kết quả chạy 40 subjects (04/05/2026).*
+*Tài liệu được cập nhật dựa trên phiên bản code tái cấu trúc (11/05/2026).*

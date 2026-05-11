@@ -57,5 +57,3 @@ Việc đánh giá được thực hiện qua hai bước chính:
 ## 5. Kết luận sau cùng
 Quy trình phân rã và đánh giá đã chứng minh rằng phương pháp **Tensor Tracking** có khả năng bắt được những biến đổi tinh vi của não bộ mà các phương pháp trung bình cộng truyền thống có thể bỏ qua.
 
----
-*Tài liệu được tạo tự động bởi Antigravity Coding Assistant.*

@@ -47,5 +47,3 @@ Các hình ảnh kết quả đã được lưu tại `outputs/eda/`:
 ## 5. Kết luận
 Quy trình đã tái lập thành công phương pháp của Ozdemir (2017) trên bộ dữ liệu ERP CORE. Kết quả cho thấy mạng lưới não bộ có sự biến đổi động rõ rệt và có thể theo dõi được thông qua phương pháp **Recursive Tensor Subspace Tracking**.
 
----
-*Tài liệu được tạo tự động bởi Antigravity Coding Assistant.*
