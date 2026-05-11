@@ -43,16 +43,16 @@ The pipeline should be executed in the following order from the project root:
    python3 -m preprocessing.pipeline
    ```
 
-2. **Step 2: Group Connectivity Computation**
-   Computes PLV tensors using RID-Rihaczek TFD with temporal matching (all 40 subjects included).
+2. **Step 2: Sampling & Balancing**
+   Filters data in the Theta band and performs 1:1 trial balancing using Temporal Matching.
    ```bash
-   python3 -m preprocessing.connectivity
+   python3 -m preprocessing.sampling
    ```
 
-3. **Step 3: Dataset Refinement**
-   Filters data in the Theta band and performs 1:1 trial balancing.
+3. **Step 3: Connectivity Computation**
+   Computes PLV tensors using RID-Rihaczek TFD for all sampled subjects.
    ```bash
-   python3 -m preprocessing.cleaning
+   python3 -m preprocessing.connectivity
    ```
 
 4. **Step 4: Tensor Decomposition (HO-RLSL)**
