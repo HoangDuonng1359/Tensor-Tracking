@@ -2,6 +2,6 @@
   "database": "dolt",
   "backend": "dolt",
   "dolt_mode": "embedded",
-  "dolt_database": "TrackingTensor3D",
-  "project_id": "0423e462-0b64-475d-a85b-fac65beaadcd"
+  "dolt_database": "TT3D",
+  "project_id": "9afce11e-8d3e-40b9-9c4b-12ae7c075dca"
 }
