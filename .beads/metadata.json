@@ -1,0 +1,7 @@
+{
+  "database": "dolt",
+  "backend": "dolt",
+  "dolt_mode": "embedded",
+  "dolt_database": "TrackingTensor3D",
+  "project_id": "0423e462-0b64-475d-a85b-fac65beaadcd"
+}
