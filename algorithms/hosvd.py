@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import argparse
 from dataclasses import replace
-from pathlib import Path
 
 import numpy as np
 from scipy.io import savemat
@@ -16,23 +15,19 @@ from algorithms.common import config_to_dict
 from algorithms.common import convert_subject_tensor_to_stream
 from algorithms.common import delete_direction
 from algorithms.common import ensure_symmetric
-from algorithms.common import project_orthogonal
 from algorithms.common import reconstruct_from_bases
 from algorithms.common import result_to_legacy_layout
-from algorithms.common import save_legacy_outputs
 from algorithms.common import save_result_bundle
-from algorithms.common import soft_threshold
 from algorithms.common import truncated_basis
 from core.config import config
 
 
-class HORLSLRunner:
+class HOSVDRunner:
   def __init__(self, decomposition_config: DecompositionConfig):
     self.config = decomposition_config
 
   def _initial_bases(self, stream: np.ndarray) -> tuple[list[np.ndarray], np.ndarray]:
     train_window = stream[: self.config.train_steps]
-    mode_count = train_window[0].ndim
     bases: list[np.ndarray] = []
     thresholds: list[float] = []
 
@@ -58,16 +53,14 @@ class HORLSLRunner:
       bases.append(mode1_basis)
       thresholds.append(mode1_threshold)
 
-    for mode in range(2, mode_count):
-      basis, threshold = truncated_basis(
-        concatenate_mode_unfoldings(train_window, mode),
-        sigma_min=self.config.sigma_min,
-        sigma_scale=self.config.sigma_scale,
-        max_rank=self.config.max_rank,
-      )
-      bases.append(basis)
-      thresholds.append(threshold)
-
+    basis2, threshold2 = truncated_basis(
+      concatenate_mode_unfoldings(train_window, 2),
+      sigma_min=self.config.sigma_min,
+      sigma_scale=self.config.sigma_scale,
+      max_rank=self.config.max_rank,
+    )
+    bases.append(basis2)
+    thresholds.append(threshold2)
     return bases, np.asarray(thresholds, dtype=np.float32)
 
   def _update_bases(
@@ -96,13 +89,12 @@ class HORLSLRunner:
         changed = True
       updated[1] = candidate
 
-    for mode in range(2, len(updated)):
-      mode_data = concatenate_mode_unfoldings(window, mode)
-      candidate = delete_direction(mode_data, updated[mode], float(thresholds[mode]))
-      candidate = add_direction(mode_data, candidate, float(thresholds[mode]), self.config.max_rank)
-      if candidate.shape != updated[mode].shape or not np.allclose(candidate, updated[mode], atol=1e-5):
-        changed = True
-      updated[mode] = candidate
+    mode2_data = concatenate_mode_unfoldings(window, 2)
+    candidate = delete_direction(mode2_data, updated[2], float(thresholds[2]))
+    candidate = add_direction(mode2_data, candidate, float(thresholds[2]), self.config.max_rank)
+    if candidate.shape != updated[2].shape or not np.allclose(candidate, updated[2], atol=1e-5):
+      changed = True
+    updated[2] = candidate
 
     return updated, changed
 
@@ -120,20 +112,15 @@ class HORLSLRunner:
 
     for t in range(n_times):
       observed = stream[t]
-      projected = project_orthogonal(observed, bases)
-      sparse_estimate = soft_threshold(projected, self.config.lambda_sparse)
-      if self.config.symmetric_modes:
-        sparse_estimate = ensure_symmetric(sparse_estimate)
-
-      lowrank_estimate = observed - sparse_estimate
-      lowrank_estimate = reconstruct_from_bases(lowrank_estimate, bases)
+      lowrank_estimate = reconstruct_from_bases(observed, bases)
       if self.config.symmetric_modes:
         lowrank_estimate = ensure_symmetric(lowrank_estimate)
 
+      sparse_estimate = observed - lowrank_estimate
       lowrank_stream[t] = lowrank_estimate.astype(np.float32)
-      sparse_stream[t] = (observed - lowrank_estimate).astype(np.float32)
-      residual_energy[t] = float(np.linalg.norm(observed - lowrank_estimate) ** 2)
-      sparse_mass[t] = float(np.sum(np.abs(sparse_stream[t])))
+      sparse_stream[t] = sparse_estimate.astype(np.float32)
+      residual_energy[t] = float(np.linalg.norm(sparse_estimate) ** 2)
+      sparse_mass[t] = float(np.sum(np.abs(sparse_estimate)))
       mode_ranks[t] = np.asarray([basis.shape[1] for basis in bases[:3]], dtype=np.int32)
 
       update_ready = t + 1 >= self.config.train_steps and (t - interval_anchor + 1) % self.config.alpha == 0
@@ -147,7 +134,7 @@ class HORLSLRunner:
 
     intervals = compute_intervals(change_points, n_times)
     return DecompositionResult(
-      algorithm="ho_rlsl",
+      algorithm="hosvd",
       config=config_to_dict(self.config),
       lowrank_stream=lowrank_stream,
       sparse_stream=sparse_stream,
@@ -170,7 +157,7 @@ def default_config_for_condition() -> DecompositionConfig:
     train_steps=10,
     alpha=8,
     sigma_min=0.11,
-    lambda_sparse=0.05,
+    lambda_sparse=0.0,
     symmetric_modes=True,
     name="eeg_default",
   )
@@ -178,22 +165,22 @@ def default_config_for_condition() -> DecompositionConfig:
 
 def save_condition_outputs(condition: str, result: DecompositionResult) -> None:
   output_dir = config.paths.TENSOR_DIR
-  bundle_path = output_dir / f"horls_{condition}_bundle.npz"
+  bundle_path = output_dir / f"hosvd_{condition}_bundle.npz"
   save_result_bundle(bundle_path, result)
 
-  lowrank_legacy, _ = result_to_legacy_layout(result)
-  np.save(output_dir / f"horls_lowrank_{condition}.npy", lowrank_legacy)
-  np.save(output_dir / f"horls_cp_{condition}.npy", result.change_points)
-  np.save(output_dir / f"horls_energy_{condition}.npy", result.residual_energy)
-  np.save(output_dir / f"horls_sparse_{condition}.npy", result.sparse_mass)
-  np.save(output_dir / f"horls_weights_{condition}.npy", result.mode_ranks[:, 0].astype(np.float32))
+  lowrank_legacy, sparse_legacy = result_to_legacy_layout(result)
+  np.save(output_dir / f"hosvd_lowrank_{condition}.npy", lowrank_legacy)
+  np.save(output_dir / f"hosvd_cp_{condition}.npy", result.change_points)
+  np.save(output_dir / f"hosvd_energy_{condition}.npy", result.residual_energy)
+  np.save(output_dir / f"hosvd_sparse_{condition}.npy", sparse_legacy)
+  np.save(output_dir / f"hosvd_weights_{condition}.npy", result.mode_ranks[:, 0].astype(np.float32))
 
-  savemat(config.paths.MATLAB_DIR / f"horls_results_{condition}.mat", {
+  savemat(config.paths.MATLAB_DIR / f"hosvd_results_{condition}.mat", {
     "lowrank": lowrank_legacy,
+    "sparse": sparse_legacy,
     "change_points": result.change_points,
     "intervals": result.intervals,
     "residual_energy": result.residual_energy,
-    "sparse_mass": result.sparse_mass,
     "mode_ranks": result.mode_ranks,
     "sigma_thresholds": result.sigma_thresholds,
   })
@@ -203,23 +190,22 @@ def run_condition(condition: str, decomposition_config: DecompositionConfig | No
   condition_config = decomposition_config or default_config_for_condition()
   subject_tensor = load_condition_tensor(condition)
   stream = convert_subject_tensor_to_stream(subject_tensor)
-  return HORLSLRunner(condition_config).run(stream)
+  return HOSVDRunner(condition_config).run(stream)
 
 
 def main() -> None:
-  parser = argparse.ArgumentParser(description="Run paper-aligned HO-RLSL on EEG tensors.")
+  parser = argparse.ArgumentParser(description="Run HoSVD baseline on EEG tensors.")
   parser.add_argument("--condition", choices=["correct", "incorrect", "both"], default="both")
   parser.add_argument("--train-steps", type=int, default=10)
   parser.add_argument("--alpha", type=int, default=8)
   parser.add_argument("--sigma-min", type=float, default=0.11)
-  parser.add_argument("--lambda-sparse", type=float, default=0.05)
   args = parser.parse_args()
 
   run_config = DecompositionConfig(
     train_steps=args.train_steps,
     alpha=args.alpha,
     sigma_min=args.sigma_min,
-    lambda_sparse=args.lambda_sparse,
+    lambda_sparse=0.0,
     symmetric_modes=True,
     name="eeg_cli",
   )
@@ -229,7 +215,7 @@ def main() -> None:
     result = run_condition(condition, decomposition_config=replace(run_config))
     save_condition_outputs(condition, result)
     print(
-      f"HO-RLSL {condition}: {len(result.change_points)} change points, "
+      f"HoSVD {condition}: {len(result.change_points)} change points, "
       f"{len(result.intervals)} intervals, thresholds={result.sigma_thresholds.tolist()}"
     )
 
