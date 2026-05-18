@@ -9,21 +9,20 @@ This document outlines the technical implementation of the High-Order Recursive 
 The HO-RLSL engine tracks the non-stationary dynamics of the EEG connectivity tensor.
 
 ### 1.1 Key Functions
-- `initialize_tucker_subspace()`: Performs HOSVD on the baseline tensor (-1000ms to 0ms) to create the initial spatial ($U$) and subject ($V$) bases.
-- `update_recursive_subspace()`: The core online update step. It projects new data onto the orthogonal complement of $U$ and identifies novel directions using an adaptive threshold ($\sigma_{min}$).
-- `extract_sparse_components()`: Uses ISTA ($L_1$ minimization) to isolate sparse noise and artifacts from the low-rank neural signal.
-- `decompose_tensor_stream()`: The main loop that iterates through time, managing subspace velocity calculation and change-point detection.
+- `HORLSLRunner._initial_bases()`: Builds the initial Tucker-mode bases from the first 10 time points across subjects.
+- `HORLSLRunner.run()`: Applies the literal HO-RLSL loop: orthogonal projection, sparse recovery, batch update every `alpha`, then delete/add direction checks for change-point detection.
+- `gtcs_s_recovery()`: Shared sparse recovery helper used to estimate the low-rank plus sparse split.
 
 ---
 
-## 2. FCCA (Fiedler Consensus Clustering) (`fcca/`)
+## 2. FCCA (`algorithms/fcca.py`)
 
 FCCA identifies stable functional communities at the group level by aggregating individual subspace reconfigurations.
 
 ### 2.1 Methodology
-1. **Consensus Matrix Computation**: `compute_consensus_clusters()` in `fcca/consensus.py` builds a co-occurrence matrix $W$ across all subjects and time windows.
-2. **Spectral Partitioning**: Nodes are assigned to clusters based on the sign of the Fiedler vector (derived from the Laplacian of $W$).
-3. **Dynamic Assessment**: `fcca/dynamics.py` compares the consensus topology between Baseline and ERN periods to quantify network integration/segregation.
+1. **Consensus Matrix Computation**: `fcca_on_lowrank_interval()` builds the co-occurrence matrix $W$ across all subjects and time points in a selected interval.
+2. **Recursive Repartitioning**: `recursive_repartitioning()` applies repeated Fiedler-based bipartitioning within each graph before consensus accumulation.
+3. **Final Spectral Partitioning**: The Fiedler vector of the consensus matrix yields the final binary partition used for interval-level reporting.
 
 ---
 
@@ -35,27 +34,27 @@ To replicate the analysis, follow these steps in order:
 ```bash
 python3 -m algorithms.ho_rlsl
 ```
-- Input: `connectivity/tensor_incorrect_4d.npy`
+- Input: `data/processed_v2/03_connectivity_tensors/tensor_incorrect_4d.npy`
 - Output: Low-rank tensors and detected change-points (`horls_*.npy`).
 
-### B. Group Consensus Clustering
+### B. Table V-style Comparison
 ```bash
-python3 -m fcca.consensus
+python3 -m analysis.reproduce_behavioral_metrics
 ```
-- Identifies global functional communities during the ERN window (0-150ms).
+- Reports ERP CORE intervals against the Ozdemir Table V targets.
 
 ### C. Dynamic Network Comparison
 ```bash
-python3 -m fcca.dynamics
+python3 -m analysis.evaluate_fcca
 ```
-- Compares Pre-Response vs. Post-Response network states.
+- Evaluates modularity across the primary Pre-ERN / ERN / Post-ERN windows and reports any supplementary late detections.
 
 ---
 
-## 4. Parameter Standards (Ozdemir 2017)
+## 4. Parameter Standards (Paper-Comparison Path)
 
-- **Rank ($r$):** 5 (Captures ~85% variance in connectivity).
+- **HO-RLSL train steps:** 10.
 - **Update Window ($\alpha$):** 8 samples (62.5ms).
-- **Sensitivity ($\sigma_{min}$):** 0.063 (Calibrated for ERN detection).
+- **Sensitivity ($\sigma_{min}$):** 0.11.
+- **HO-RLSL sparse penalty ($\lambda$):** 0.2 for the Table V-style analysis path.
 - **Band:** Theta (4-8 Hz).
-

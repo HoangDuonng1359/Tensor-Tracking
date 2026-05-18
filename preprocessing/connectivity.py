@@ -5,34 +5,8 @@ from pathlib import Path
 from scipy.io import savemat
 from typing import List, Optional, Tuple
 from core.config import config
+from algorithms.time_frequency import RIDRihaczek
 
-def compute_rid_rihaczek_tfd(signal_tensor: torch.Tensor) -> torch.Tensor:
-  """Compute RID-Rihaczek TFD on GPU."""
-  n_trials, n_points = signal_tensor.shape
-  device = signal_tensor.device
-  
-  # Time and frequency grids
-  t = torch.arange(n_points, device=device).float()
-  theta = torch.fft.fftfreq(n_points, d=1.0, device=device) * 2 * np.pi
-  
-  # Kernel (Exponential for RID)
-  # RID-Rihaczek specific: g(theta, tau) = exp(-j * theta * tau / 2)
-  # Here we simplify the TFD implementation for PLV purposes
-  
-  # Analytic signal via Hilbert transform
-  analytic = torch.fft.ifft(torch.fft.fft(signal_tensor, dim=1) * 2, dim=1)
-  analytic[:, n_points//2:] = 0
-  
-  # TFR Calculation
-  # For PLV, we need the phase of the TFR at theta band
-  # Using a simplified RID-Rihaczek approach
-  RID_theta = torch.zeros((n_trials, n_points, n_points), dtype=torch.complex64, device=device)
-  for tau in range(-n_points//2, n_points//2):
-    shifted = torch.roll(analytic, shifts=-tau, dims=1)
-    RID_theta[:, :, tau + n_points//2] = analytic * torch.conj(shifted) * np.exp(-1j * tau / 2)
-
-  RID_t_f = torch.fft.ifft(torch.fft.ifft(RID_theta, dim=1), dim=2)
-  return RID_t_f
 
 def compute_group_connectivity() -> None:
   """
@@ -64,28 +38,44 @@ def compute_group_connectivity() -> None:
     sub_plv_cor = np.zeros((n_channels, n_channels, n_points), dtype=np.float32)
     sub_plv_inc = np.zeros((n_channels, n_channels, n_points), dtype=np.float32)
 
+    tfd_engine = RIDRihaczek(n_points)
+    
+    # Precompute theta mask
+    freq_axis = torch.fft.fftfreq(n_points, d=1/config.eeg.SFREQ, device=device)
+    theta_mask = (freq_axis >= config.proc.THETA_BAND[0]) & (freq_axis <= config.proc.THETA_BAND[1])
+    theta_freq_indices = torch.where(theta_mask)[0]
+
     for condition, storage in [('Correct', sub_plv_cor), ('Incorrect', sub_plv_inc)]:
       data = torch.tensor(epochs[condition].get_data(), dtype=torch.float32, device=device)
-      n_trials, _, n_points = data.shape
-      theta_complex = torch.zeros((n_trials, n_channels, n_points), dtype=torch.complex64, device=device)
+      n_trials, n_channels, n_points = data.shape
+      if n_trials == 0: continue
       
-      # Frequency axis for RID-Rihaczek
-      freq_axis = torch.fft.fftfreq(n_points, d=1/config.eeg.SFREQ, device=device)
-      theta_mask = (freq_axis >= config.proc.THETA_BAND[0]) & (freq_axis <= config.proc.THETA_BAND[1])
+      # Compute TFD for all channels
+      # TFD shape: (n_trials, n_points, n_points) -> (trials, time, freq)
+      # We need to compute this per channel
+      
+      # We will store the normalized complex values (phase) for the theta band
+      # Shape: (n_trials, n_channels, n_points, n_theta_freqs)
+      theta_phases = torch.zeros((n_trials, n_channels, n_points, len(theta_freq_indices)), 
+                                 dtype=torch.complex64, device=device)
       
       for ch in range(n_channels):
-        C = compute_rid_rihaczek_tfd(data[:, ch, :])
-        # Average over theta band
-        theta_complex[:, ch, :] = torch.mean(C[:, :, theta_mask], dim=2)
-      
-      theta_complex /= (torch.abs(theta_complex) + 1e-12)
-      
+          tfr = tfd_engine.compute_tfd(data[:, ch, :]) # (trials, time, freq)
+          # Extract theta frequencies and normalize
+          theta_samples = tfr[:, :, theta_mask] # (trials, time, n_theta)
+          theta_phases[:, ch, :, :] = theta_samples / (torch.abs(theta_samples) + 1e-12)
+          
+      # PLV = |mean_trials( exp(j * (phi1 - phi2)) )|
+      # We average PLV over the theta frequencies as per standard TFD-PLV
       for ch1 in range(n_channels):
-        for ch2 in range(ch1 + 1, n_channels):
-          # PLV = |mean(exp(j * delta_phi))|
-          plv = torch.abs(torch.mean(theta_complex[:, ch1, :] * torch.conj(theta_complex[:, ch2, :]), dim=0))
-          storage[ch1, ch2, :] = plv.cpu().numpy()
-          storage[ch2, ch1, :] = plv.cpu().numpy()
+          for ch2 in range(ch1 + 1, n_channels):
+              # Complex product across trials for each (time, freq)
+              # Result shape: (n_points, n_theta)
+              sync = torch.abs(torch.mean(theta_phases[:, ch1, :, :] * torch.conj(theta_phases[:, ch2, :, :]), dim=0))
+              # Average over the theta frequency bins
+              plv_time_series = torch.mean(sync, dim=1)
+              storage[ch1, ch2, :] = plv_time_series.cpu().numpy()
+              storage[ch2, ch1, :] = plv_time_series.cpu().numpy()
     
     all_corr.append(sub_plv_cor)
     all_inc.append(sub_plv_inc)

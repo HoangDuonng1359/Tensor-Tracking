@@ -23,9 +23,8 @@ def preprocess_individual_subject(subject_id: str, visualize: bool = False) -> m
   raw.rename_channels(lambda x: rename_map.get(x, x))
   raw.set_montage(config.eeg.MONTAGE_NAME, on_missing='ignore')
   
-  # Resampling & Filtering
+  # Resampling to 128Hz as per Section 2.3
   raw.resample(config.eeg.SFREQ)
-  raw.filter(config.proc.FILTER_LOW, config.proc.FILTER_HIGH, fir_design='firwin', verbose=False)
   
   # Pick Channels
   available_eeg: List[str] = [ch for ch in config.eeg.CHANNELS if ch in raw.ch_names]
@@ -43,8 +42,8 @@ def preprocess_individual_subject(subject_id: str, visualize: bool = False) -> m
   epochs = mne.Epochs(
     raw_csd, events, event_id=resp_id, 
     tmin=config.eeg.TMIN, tmax=config.eeg.TMAX, 
-    baseline=config.eeg.BASELINE, preload=True, 
-    detrend=1, verbose=False
+    baseline=None, preload=True, 
+    detrend=None, verbose=False
   )
   
   mapping = {l: f"Correct/{l}" for l in correct_codes}

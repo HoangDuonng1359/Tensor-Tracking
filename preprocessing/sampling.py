@@ -49,12 +49,8 @@ def run_sampling_pipeline() -> None:
     subject_id: str = f.stem.split('_')[0]
     epochs = mne.read_epochs(f, preload=True, verbose=False)
     
-    # 1. Theta Band Filtering (4-8 Hz)
-    epochs_theta = epochs.copy().filter(
-      l_freq=config.proc.THETA_BAND[0], 
-      h_freq=config.proc.THETA_BAND[1], 
-      fir_design='firwin', verbose=False
-    )
+    # 1. Skip explicit filtering (Paper uses RID-Rihaczek on broadband or raw signal)
+    epochs_theta = epochs.copy()
     
     # 2. Temporal Matching Subsampling
     balanced_epochs = match_temporal_trials(epochs_theta)

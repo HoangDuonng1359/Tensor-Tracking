@@ -10,9 +10,9 @@ Chúng ta đã áp dụng thuật toán **Higher-Order Recursive Low-Rank + Spar
 
 ### Đặc tính Động của Mạng lưới (Network Dynamics)
 - **Năng lượng mạng (Network Energy)**: Biểu thị mức độ hoạt động đồng bộ của mạng lưới.
-    - Kết quả cho thấy năng lượng tăng vọt trong khoảng **50-100ms** sau khi phản ứng lỗi (Incorrect), tương ứng với sự xuất hiện của thành phần ERN.
+    - Trên ERP CORE, cửa sổ ERN chính được script `analysis.reproduce_behavioral_metrics` tóm tắt theo phong cách Table V, nhưng không còn được mô tả như một bản tái lập "exact reproduction".
 - **Điểm thay đổi (Change-points)**: Thuật toán đã tự động phát hiện các thời điểm mà mạng lưới não bộ thay đổi cấu trúc nhanh chóng.
-    - Các điểm thay đổi thường tập trung quanh mốc **0ms** (thời điểm ra quyết định) và **150ms** (giai đoạn đánh giá lỗi).
+    - Các điểm thay đổi quanh ERN thường xuất hiện gần mốc trước 0ms và sau 100ms, nhưng có thể xuất hiện thêm các khoảng hậu ERN phụ do ERP CORE có ít subjects và ít channels hơn paper gốc.
 
 ---
 
@@ -23,17 +23,14 @@ Biểu đồ `ozdemir_replicated_dynamics.png` cho thấy sự phân bổ tầm 
 
 ---
 
-## 3. Kiểm định Thống kê (Statistical Validation)
-Chúng ta đã thực hiện so sánh đối chiếu giữa hai điều kiện: **Correct (Làm đúng)** và **Incorrect (Làm sai)**.
+## 3. Kiểm định và Diễn giải (Validation)
+Các script chính hiện được chia làm hai lớp:
+- **Table V-style comparison**: `analysis.reproduce_behavioral_metrics`
+- **FCCA modularity over primary ERN windows**: `analysis.evaluate_fcca`
 
-### So sánh Năng lượng (T-test)
-- **Kết quả**: Có sự khác biệt đáng kể về năng lượng mạng lưới giữa Incorrect và Correct trong khoảng thời gian 25-100ms. 
-- **Ý nghĩa**: Điều này chứng minh rằng mạng lưới "kiểm soát lỗi" hoạt động mạnh mẽ và có cấu trúc khác biệt hoàn toàn so với mạng lưới "phản hồi đúng".
-
-### Tương quan Hành vi (Behavioral Correlation)
-- **Chỉ số**: Tương quan giữa năng lượng đỉnh ERN và tỉ lệ lỗi (Error Rate) của từng cá nhân.
-- **Kết quả hiện tại**: $R = -0.107, p = 0.819$ (với $n=7$ subjects).
-- **Nhận xét**: Hiện tại kết quả tương quan chưa đạt mức ý nghĩa thống kê ($p > 0.05$). Điều này chủ yếu do cỡ mẫu hiện tại còn nhỏ (mới chạy cho 7/40 subjects). Khi mở rộng cho toàn bộ 40 subjects, giá trị $p$ kỳ vọng sẽ cải thiện.
+Kết quả được diễn giải theo nguyên tắc:
+- So sánh với Ozdemir (2017) ở mức **high-fidelity**.
+- Giải thích rõ các sai khác còn lại bằng ràng buộc của ERP CORE thay vì mô tả như lỗi implementation nếu chưa có bằng chứng code-level.
 
 ---
 
@@ -45,5 +42,4 @@ Các hình ảnh kết quả đã được lưu tại `outputs/eda/`:
 ---
 
 ## 5. Kết luận
-Quy trình đã tái lập thành công phương pháp của Ozdemir (2017) trên bộ dữ liệu ERP CORE. Kết quả cho thấy mạng lưới não bộ có sự biến đổi động rõ rệt và có thể theo dõi được thông qua phương pháp **Recursive Tensor Subspace Tracking**.
-
+Quy trình hiện tại là một **high-fidelity reproduction on ERP CORE** của Ozdemir (2017). Kết quả được báo cáo theo hướng bám sát paper, đồng thời nêu rõ các khác biệt do số lượng subjects, số channels và chiến lược cân bằng trial.

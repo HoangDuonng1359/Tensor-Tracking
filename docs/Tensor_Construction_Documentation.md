@@ -29,10 +29,10 @@ Dự án sử dụng **Reduced Interference Rihaczek Distribution (RID-Rihaczek)
 Dữ liệu từ **40 đối tượng** được tổng hợp thành các khối Tensor:
 
 ### Tensor tổng hợp (4D):
-- **Kích thước**: `(40, 30, 30, 256)`
+- **Kích thước**: `(40, 30, 30, 257)`
     - `40`: Số lượng người tham gia (bao gồm toàn bộ dataset).
     - `30 x 30`: Ma trận kết nối giữa các cặp kênh.
-    - `256`: Các mốc thời gian (tương ứng 2 giây tại 128Hz).
+    - `257`: Các mốc thời gian (tương ứng 2 giây tại 128Hz, bao gồm mốc 0).
 
 ---
 

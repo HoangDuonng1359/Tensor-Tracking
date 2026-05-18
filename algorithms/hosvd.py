@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+from dataclasses import dataclass
 from dataclasses import replace
 
 import numpy as np
@@ -20,6 +21,14 @@ from algorithms.common import result_to_legacy_layout
 from algorithms.common import save_result_bundle
 from algorithms.common import truncated_basis
 from core.config import config
+
+
+@dataclass(frozen=True)
+class PaperComparisonConfig:
+  train_steps: int = 10
+  alpha: int = 8
+  sigma_min: float = 0.11
+  max_rank: int = 3
 
 
 class HOSVDRunner:
@@ -119,8 +128,8 @@ class HOSVDRunner:
       sparse_estimate = observed - lowrank_estimate
       lowrank_stream[t] = lowrank_estimate.astype(np.float32)
       sparse_stream[t] = sparse_estimate.astype(np.float32)
-      residual_energy[t] = float(np.linalg.norm(sparse_estimate) ** 2)
-      sparse_mass[t] = float(np.sum(np.abs(sparse_estimate)))
+      residual_energy[t] = float(np.mean(sparse_estimate ** 2))
+      sparse_mass[t] = float(np.mean(np.abs(sparse_estimate)))
       mode_ranks[t] = np.asarray([basis.shape[1] for basis in bases[:3]], dtype=np.int32)
 
       update_ready = t + 1 >= self.config.train_steps and (t - interval_anchor + 1) % self.config.alpha == 0
@@ -158,6 +167,7 @@ def default_config_for_condition() -> DecompositionConfig:
     alpha=8,
     sigma_min=0.11,
     lambda_sparse=0.0,
+    max_rank=4,
     symmetric_modes=True,
     name="eeg_default",
   )
@@ -165,15 +175,19 @@ def default_config_for_condition() -> DecompositionConfig:
 
 def save_condition_outputs(condition: str, result: DecompositionResult) -> None:
   output_dir = config.paths.TENSOR_DIR
+  artifact_prefix = output_dir / f"hosvd_{condition}"
   bundle_path = output_dir / f"hosvd_{condition}_bundle.npz"
   save_result_bundle(bundle_path, result)
 
   lowrank_legacy, sparse_legacy = result_to_legacy_layout(result)
-  np.save(output_dir / f"hosvd_lowrank_{condition}.npy", lowrank_legacy)
-  np.save(output_dir / f"hosvd_cp_{condition}.npy", result.change_points)
-  np.save(output_dir / f"hosvd_energy_{condition}.npy", result.residual_energy)
-  np.save(output_dir / f"hosvd_sparse_{condition}.npy", sparse_legacy)
-  np.save(output_dir / f"hosvd_weights_{condition}.npy", result.mode_ranks[:, 0].astype(np.float32))
+  np.save(output_dir / f"{artifact_prefix.name}_lowrank.npy", lowrank_legacy)
+  np.save(output_dir / f"{artifact_prefix.name}_sparse.npy", sparse_legacy)
+  np.save(output_dir / f"{artifact_prefix.name}_cp.npy", result.change_points)
+  np.save(output_dir / f"{artifact_prefix.name}_intervals.npy", result.intervals)
+  np.save(output_dir / f"{artifact_prefix.name}_energy.npy", result.residual_energy)
+  np.save(output_dir / f"{artifact_prefix.name}_sparse_mass.npy", result.sparse_mass)
+  np.save(output_dir / f"{artifact_prefix.name}_mode_ranks.npy", result.mode_ranks)
+  np.save(output_dir / f"{artifact_prefix.name}_mode_rank_trace.npy", result.mode_ranks[:, 0].astype(np.float32))
 
   savemat(config.paths.MATLAB_DIR / f"hosvd_results_{condition}.mat", {
     "lowrank": lowrank_legacy,
@@ -222,3 +236,36 @@ def main() -> None:
 
 if __name__ == "__main__":
   main()
+
+def windowed_hosvd_tracking(tensor_4d: np.ndarray, config: PaperComparisonConfig) -> np.ndarray:
+  """
+  Paper-comparison HoSVD approximation used only for Table V-style reporting.
+
+  This function is intentionally separate from ``HOSVDRunner``. The runner is
+  the canonical tracked decomposition used elsewhere in the repo; this helper
+  preserves the historic windowed comparison path used to approximate the paper's
+  HoSVD interval table.
+  """
+  _, n_chan, _, n_times = tensor_4d.shape
+  stream = np.transpose(tensor_4d, (3, 1, 2, 0))
+
+  train_data = stream[: config.train_steps]
+  mean_train = np.mean(train_data, axis=0)
+  basis, _, _ = np.linalg.svd(mean_train.reshape(n_chan, -1), full_matrices=False)
+  basis = basis[:, : config.max_rank]
+
+  change_points: list[int] = []
+  for t in range(config.train_steps, n_times, config.alpha):
+    window = stream[t : t + config.alpha]
+    if len(window) < config.alpha:
+      break
+
+    mean_window = np.mean(window, axis=0)
+    projected = basis @ (basis.T @ mean_window.reshape(n_chan, -1))
+    error = np.linalg.norm(mean_window.reshape(n_chan, -1) - projected) / np.linalg.norm(mean_window)
+    if error > 0.15:
+      change_points.append(t)
+      basis, _, _ = np.linalg.svd(mean_window.reshape(n_chan, -1), full_matrices=False)
+      basis = basis[:, : config.max_rank]
+
+  return np.asarray(change_points, dtype=np.int32)

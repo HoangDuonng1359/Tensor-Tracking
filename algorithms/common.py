@@ -6,6 +6,10 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
+import torch
+from scipy.io import savemat
+
+from core.timing import eeg_timing
 
 
 @dataclass
@@ -18,6 +22,7 @@ class DecompositionConfig:
   max_rank: int | None = None
   symmetric_modes: bool = True
   name: str = "default"
+  recovery_mode: str = "pgd"
 
 
 @dataclass
@@ -36,6 +41,103 @@ class DecompositionResult:
 
 def soft_threshold(values: np.ndarray, threshold: float) -> np.ndarray:
   return np.sign(values) * np.maximum(np.abs(values) - threshold, 0.0)
+
+
+def gtcs_s_recovery(
+  Y: np.ndarray,
+  projectors: list[np.ndarray],
+  lambda_sparse: float,
+  iterations: int = 5,
+  recovery_mode: str = "pgd",
+) -> np.ndarray:
+  """
+  Generalized Tensor Compressive Sensing recovery.
+  Supports both parallel PGD (Proximal Gradient Descent) and literal serial GTCS-S.
+  """
+  if recovery_mode == "gtcs_s_serial":
+      return gtcs_s_serial_recovery(Y, projectors, lambda_sparse, iterations)
+      
+  device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+  
+  # Convert to torch for performance
+  Y_t = torch.as_tensor(Y, device=device, dtype=torch.float32)
+  P_t = [torch.as_tensor(p, device=device, dtype=torch.float32) for p in projectors]
+  S_t = Y_t.clone()
+  
+  for _ in range(iterations):
+    # Forward projection
+    Y_est = S_t
+    for mode, P in enumerate(P_t):
+      # mode_product using torch.tensordot
+      Y_est = torch.moveaxis(torch.tensordot(P, torch.moveaxis(Y_est, mode, 0), dims=([1], [0])), 0, mode)
+
+    # Gradient update
+    error = Y_t - Y_est
+    update = error
+    for mode, P in enumerate(P_t):
+      update = torch.moveaxis(torch.tensordot(P, torch.moveaxis(update, mode, 0), dims=([1], [0])), 0, mode)
+
+    S_t = S_t + update
+    # Proximal step (soft thresholding)
+    S_t = torch.sign(S_t) * torch.clamp(torch.abs(S_t) - lambda_sparse, min=0.0)
+
+  return S_t.cpu().numpy()
+
+
+def gtcs_s_serial_recovery(
+  Y: np.ndarray,
+  projectors: list[np.ndarray],
+  lambda_sparse: float,
+  iterations: int = 5,
+) -> np.ndarray:
+  """
+  Literal serial recovery procedure for compressed tensors (GTCS-S).
+  Repeatedly unfolds the tensor along each mode and applies coordinate-descent style
+  l1 proximal steps (soft thresholding) sequentially.
+  """
+  device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+  Y_t = torch.as_tensor(Y, device=device, dtype=torch.float32)
+  P_t = [torch.as_tensor(p, device=device, dtype=torch.float32) for p in projectors]
+  S_t = Y_t.clone()
+
+  for _ in range(iterations):
+    # Mode-by-mode sequential update
+    for mode in range(3):
+      # Current projection of S along this mode
+      P = P_t[mode]
+      S_proj = torch.moveaxis(torch.tensordot(P, torch.moveaxis(S_t, mode, 0), dims=([1], [0])), 0, mode)
+      
+      # Residual error along this mode
+      error = Y_t - S_proj
+      update = torch.moveaxis(torch.tensordot(P, torch.moveaxis(error, mode, 0), dims=([1], [0])), 0, mode)
+      
+      # Update S for this mode
+      S_t = S_t + update
+      
+      # Proximal soft-thresholding step
+      S_t = torch.sign(S_t) * torch.clamp(torch.abs(S_t) - lambda_sparse, min=0.0)
+
+  return S_t.cpu().numpy()
+
+
+def calculate_nmse(original: np.ndarray, estimated: np.ndarray) -> float:
+  """Normalized Mean Square Error."""
+  denom = np.linalg.norm(original) ** 2
+  if denom < 1e-10: return 0.0
+  return float(np.linalg.norm(original - estimated) ** 2 / denom)
+
+
+def subspace_distance(U_true: np.ndarray, U_est: np.ndarray) -> float:
+  """
+  Subspace Projection Distance. 
+  Measures the distance between the true subspace and the estimated subspace.
+  Range: [0, 1], where 0 means identical subspaces.
+  """
+  k = U_true.shape[1]
+  if k == 0: return 1.0
+  # Projection distance: 1 - (1/k) * ||U_est.T @ U_true||_F^2
+  val = np.linalg.norm(U_est.T @ U_true) ** 2 / k
+  return float(1.0 - val)
 
 
 def ensure_symmetric(tensor: np.ndarray) -> np.ndarray:
@@ -176,20 +278,35 @@ def save_result_bundle(path: Path, result: DecompositionResult) -> None:
     sigma_thresholds=result.sigma_thresholds,
   )
   metadata_path = path.with_suffix(".json")
+  timing = eeg_timing(result.lowrank_stream.shape[0])
   metadata = {
     "algorithm": result.algorithm,
     "config": result.config,
+    "timing": timing.to_metadata(),
+    "artifacts": {
+      "change_points": f"{path.stem.replace('_bundle', '')}_cp.npy",
+      "intervals": f"{path.stem.replace('_bundle', '')}_intervals.npy",
+      "residual_energy": f"{path.stem.replace('_bundle', '')}_energy.npy",
+      "sparse_mass": f"{path.stem.replace('_bundle', '')}_sparse_mass.npy",
+      "mode_ranks": f"{path.stem.replace('_bundle', '')}_mode_ranks.npy",
+      "mode_rank_trace": f"{path.stem.replace('_bundle', '')}_mode_rank_trace.npy",
+      "lowrank_tensor": f"{path.stem.replace('_bundle', '')}_lowrank.npy",
+      "sparse_tensor": f"{path.stem.replace('_bundle', '')}_sparse.npy",
+    },
   }
   metadata_path.write_text(json.dumps(metadata, indent=2), encoding="utf-8")
 
 
 def save_legacy_outputs(prefix: Path, result: DecompositionResult) -> None:
-  lowrank_legacy, _ = result_to_legacy_layout(result)
+  lowrank_legacy, sparse_legacy = result_to_legacy_layout(result)
   np.save(prefix.parent / f"{prefix.name}_lowrank.npy", lowrank_legacy)
+  np.save(prefix.parent / f"{prefix.name}_sparse.npy", sparse_legacy)
   np.save(prefix.parent / f"{prefix.name}_cp.npy", result.change_points)
+  np.save(prefix.parent / f"{prefix.name}_intervals.npy", result.intervals)
   np.save(prefix.parent / f"{prefix.name}_energy.npy", result.residual_energy)
-  first_mode_weights = result.mode_ranks[:, 0].astype(np.float32)
-  np.save(prefix.parent / f"{prefix.name}_weights.npy", first_mode_weights)
+  np.save(prefix.parent / f"{prefix.name}_sparse_mass.npy", result.sparse_mass)
+  np.save(prefix.parent / f"{prefix.name}_mode_ranks.npy", result.mode_ranks)
+  np.save(prefix.parent / f"{prefix.name}_mode_rank_trace.npy", result.mode_ranks[:, 0].astype(np.float32))
 
 
 def save_summary_json(path: Path, payload: dict[str, Any]) -> None:

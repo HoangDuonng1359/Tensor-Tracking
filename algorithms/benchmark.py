@@ -8,11 +8,11 @@ from pathlib import Path
 import matplotlib.pyplot as plt
 import numpy as np
 
-from algorithms.common import DecompositionConfig
-from algorithms.common import convert_subject_tensor_to_stream
+from algorithms.common import DecompositionConfig, DecompositionResult, convert_subject_tensor_to_stream
 from algorithms.ho_rlsl import HORLSLRunner
 from algorithms.hosvd import HOSVDRunner
 from core.config import config
+from core.timing import eeg_timing, EEGTiming
 
 
 def _subject_sample_from_template(template: np.ndarray, rng: np.random.Generator) -> np.ndarray:
@@ -190,8 +190,28 @@ def run_synthetic_benchmark(output_dir: Path, simulations: int = 20) -> None:
     writer.writerows(rows)
 
 
-def _eeg_time_axis(n_times: int) -> np.ndarray:
-  return np.linspace(config.eeg.TMIN, config.eeg.TMAX, n_times, dtype=np.float32)
+def _rows_for_eeg_result(
+  condition: str,
+  algorithm: str,
+  result: DecompositionResult,
+  timing: EEGTiming,
+) -> list[dict[str, Any]]:
+  rows = []
+  for interval_index, (start, end) in enumerate(result.intervals.tolist(), start=1):
+    rows.append({
+      "condition": condition,
+      "algorithm": algorithm,
+      "interval_index": interval_index,
+      "start_idx": int(start),
+      "end_idx": int(end),
+      "start_s": float(timing.index_to_s(start)),
+      "end_s": float(timing.index_to_s(end)),
+      "start_ms": float(timing.index_to_ms(start)),
+      "end_ms": float(timing.index_to_ms(end)),
+      "change_point_count": len(result.change_points),
+      "timing_reference": timing.zero_reference,
+    })
+  return rows
 
 
 def _write_eeg_interval_csv(output_dir: Path, rows: list[dict[str, object]]) -> None:
@@ -236,7 +256,8 @@ def run_eeg_benchmark(output_dir: Path) -> None:
   }.items():
     subject_tensor = np.load(tensor_path).astype(np.float32)
     stream = convert_subject_tensor_to_stream(subject_tensor)
-    time_axis = _eeg_time_axis(stream.shape[0])
+    timing = eeg_timing(stream.shape[0])
+    time_axis = timing.time_s
 
     run_config = DecompositionConfig(
       train_steps=10,
@@ -252,17 +273,7 @@ def run_eeg_benchmark(output_dir: Path) -> None:
       algorithm_config = replace(run_config, lambda_sparse=0.0 if algorithm_name == "hosvd" else 0.05)
       result = runner_cls(algorithm_config).run(stream)
       condition_results[algorithm_name] = result
-      for interval_index, (start, end) in enumerate(result.intervals.tolist(), start=1):
-        rows.append({
-          "condition": condition,
-          "algorithm": algorithm_name,
-          "interval_index": interval_index,
-          "start_idx": start,
-          "end_idx": end,
-          "start_s": float(time_axis[start]),
-          "end_s": float(time_axis[end]),
-          "change_point_count": len(result.change_points),
-        })
+      rows.extend(_rows_for_eeg_result(condition, algorithm_name, result, timing))
 
     _plot_eeg_condition(output_dir, condition, condition_results, time_axis)
 
