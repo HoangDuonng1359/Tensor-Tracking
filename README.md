@@ -11,8 +11,6 @@ tensor_de_v2.py                 Script phân tích chính
 streamlit_app.py                Giao diện web để xem tensor, ERP và kết quả FCCA
 tensor_4d/                      Tensor kết nối não đã tạo sẵn
 fcca_results/                   Kết quả phân tích và hình xuất ra
-01_initial_epochs/              EEG epoch dạng FIF
-02_balanced_theta_epochs/       EEG epoch đã cân bằng theta
 ERN_Raw_Data_BIDS-Compatible/   Dữ liệu EEG gốc dạng BIDS/EEGLAB
 ```
 
@@ -61,7 +59,7 @@ Luồng xử lý chính nằm trong hàm `main()`:
 
 ### `tucker_low_rank_decomposition`
 
-Giảm nhiễu tensor bằng phân rã Tucker.
+Giảm nhiễu tensor bằng phân rã Tucker, sử dụng thư viện tensorly.
 
 Kết quả gồm:
 
@@ -115,13 +113,7 @@ Nếu không, code dùng trung bình kết nối từ tensor làm đường thay
 Cài các thư viện cần thiết:
 
 ```bash
-pip install numpy scipy matplotlib tensorly networkx mne streamlit pandas
-```
-
-Các thư viện nên có nhưng không bắt buộc:
-
-```bash
-pip install ruptures dyconnmap
+pip install numpy scipy matplotlib tensorly networkx mne streamlit pandas ruptures dyconnmap
 ```
 
 Chạy phân tích:
