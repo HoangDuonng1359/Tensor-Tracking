@@ -1,0 +1,928 @@
+from pathlib import Path
+import warnings
+
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+from scipy.linalg import eigh
+import streamlit as st
+
+import tensor_de_v2 as analysis
+
+try:
+    import mne
+
+    HAS_MNE = True
+except ImportError:
+    mne = None
+    HAS_MNE = False
+
+try:
+    import networkx as nx
+
+    if not hasattr(nx, "from_numpy_matrix") and hasattr(nx, "from_numpy_array"):
+        nx.from_numpy_matrix = nx.from_numpy_array
+except ImportError:
+    nx = None
+
+try:
+    from dyconnmap.graphs import threshold_omst_global_cost_efficiency
+
+    HAS_DYCONNMAP = True
+except ImportError:
+    HAS_DYCONNMAP = False
+
+
+ROOT = Path(__file__).resolve().parent
+TENSOR_FILES = {
+    condition: ROOT / path
+    for condition, path in analysis.CONDITION_FILES.items()
+}
+RESULTS_FILE = ROOT / analysis.OUTPUT_DIR / "fcca_results.npz"
+FIGURE_DIR = ROOT / analysis.FIGURE_DIR
+EPOCH_DIR = ROOT / analysis.EPOCH_DIR
+RAW_BIDS_DIR = ROOT / analysis.RAW_BIDS_DIR
+INTERVAL_NAMES = analysis.INTERVAL_NAMES
+N_CHANGE_POINTS = analysis.N_CHANGE_POINTS
+MIN_INTERVAL_FRAMES = analysis.MIN_INTERVAL_FRAMES
+PREFERRED_ERP_CHANNELS = analysis.PREFERRED_ERP_CHANNELS
+ERP_BASELINE_MS = analysis.ERP_BASELINE_MS
+TUCKER_RANK = analysis.TUCKER_RANK
+
+
+st.set_page_config(
+    page_title="Brain Connectivity Explorer",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
+
+
+@st.cache_data(show_spinner=False)
+def load_tensor(path_str):
+    return np.load(path_str)
+
+
+@st.cache_data(show_spinner="Running Tucker low-rank decomposition...")
+def load_analysis_tensor(path_str, use_low_rank):
+    X = np.load(path_str)
+    if not use_low_rank:
+        return X
+
+    L, _, _, _ = analysis.tucker_low_rank_decomposition(X, rank=TUCKER_RANK)
+    return L
+
+
+@st.cache_data(show_spinner=False)
+def load_fcca_results(path_str):
+    path = Path(path_str)
+    if not path.exists():
+        return {}
+
+    with np.load(path, allow_pickle=True) as npz:
+        return {key: npz[key] for key in npz.files}
+
+
+@st.cache_data(show_spinner="Loading ERP traces with tensor_de_v2 pipeline...")
+def load_analysis_erp_traces(conditions):
+    if not analysis.HAS_MNE:
+        return {}, "mne is not installed, so EEG ERP traces cannot be read."
+
+    erp = analysis.load_erp_traces(conditions=conditions)
+    if not erp:
+        return {}, "No ERP traces could be extracted; falling back to tensor connectivity."
+
+    return erp, None
+
+
+@st.cache_data(show_spinner="Running FCCA interval analysis...")
+def run_fcca_interval_cached(path_str, frames_tuple, use_low_rank):
+    X = load_analysis_tensor(path_str, use_low_rank)
+    return analysis.run_fcca_interval(X, np.asarray(frames_tuple, dtype=int))
+
+
+def condition_event_names(epochs, condition):
+    names = list(getattr(epochs, "event_id", {}).keys())
+    if not names:
+        return []
+
+    selected = []
+    for name in names:
+        normalized = name.lower()
+        has_error = any(token in normalized for token in ("incorrect", "error", "wrong", "ern"))
+        has_correct = any(token in normalized for token in ("correct", "crn"))
+
+        if condition == "incorrect" and has_error:
+            selected.append(name)
+        elif condition == "correct" and has_correct and not any(
+            token in normalized for token in ("incorrect", "error", "wrong")
+        ):
+            selected.append(name)
+
+    return selected
+
+
+def choose_erp_channel(epochs, preferred_channels=PREFERRED_ERP_CHANNELS):
+    channel_lookup = {name.lower(): idx for idx, name in enumerate(epochs.ch_names)}
+    for preferred in preferred_channels:
+        idx = channel_lookup.get(preferred.lower())
+        if idx is not None:
+            return idx, epochs.ch_names[idx]
+
+    picks = mne.pick_types(epochs.info, eeg=True, meg=False, exclude="bads")
+    if len(picks) > 0:
+        idx = int(picks[0])
+        return idx, epochs.ch_names[idx]
+
+    return 0, epochs.ch_names[0]
+
+
+def baseline_correct_trace(trace, times_ms, baseline_ms=ERP_BASELINE_MS):
+    baseline_mask = (times_ms >= baseline_ms[0]) & (times_ms <= baseline_ms[1])
+    if not baseline_mask.any():
+        baseline_mask = times_ms < 0
+    if baseline_mask.any():
+        return trace - np.nanmean(trace[baseline_mask])
+    return trace - np.nanmean(trace)
+
+
+def epochs_to_condition_trace(epochs, condition):
+    event_names = condition_event_names(epochs, condition)
+    if event_names:
+        epochs = epochs[event_names]
+
+    if len(epochs) == 0:
+        return None
+
+    channel_idx, channel_name = choose_erp_channel(epochs)
+    channel_type = epochs.get_channel_types(picks=[channel_idx])[0]
+    data = epochs.get_data()[:, channel_idx, :]
+    trace = data.mean(axis=0)
+    times_ms = np.asarray(epochs.times * 1000.0, dtype=float)
+
+    # MNE stores EEG in volts. CSD data are not voltage, so do not convert them to uV.
+    if channel_type == "eeg" and np.nanmax(np.abs(trace)) < 1e-3:
+        trace = trace * 1e6
+
+    trace = baseline_correct_trace(np.asarray(trace, dtype=float), times_ms)
+
+    return {
+        "trace": trace,
+        "times_ms": times_ms,
+        "n_epochs": len(epochs),
+        "channel": channel_name,
+        "channel_type": channel_type,
+        "events": tuple(event_names) if event_names else ("all",),
+    }
+
+
+@st.cache_data(show_spinner=False)
+def load_erp_traces(epoch_dir_str, conditions):
+    if not HAS_MNE:
+        return {}, "mne is not installed, so FIF EEG epochs cannot be read."
+
+    epoch_dir = Path(epoch_dir_str)
+    fif_files = sorted(epoch_dir.glob("*-epo.fif"))
+    if not fif_files:
+        return {}, f"No *-epo.fif files were found in {epoch_dir}."
+
+    collected = {
+        condition: {
+            "traces": [],
+            "times_ms": None,
+            "n_epochs": 0,
+            "subjects": 0,
+            "channels": [],
+            "events": set(),
+        }
+        for condition in conditions
+    }
+
+    for fif_file in fif_files:
+        try:
+            epochs = mne.read_epochs(fif_file, preload=True, verbose=False)
+        except Exception:
+            continue
+
+        for condition in conditions:
+            item = epochs_to_condition_trace(epochs, condition)
+            if item is None:
+                continue
+
+            target = collected[condition]
+            if target["times_ms"] is None:
+                target["times_ms"] = item["times_ms"]
+                trace = item["trace"]
+            else:
+                trace = np.interp(target["times_ms"], item["times_ms"], item["trace"])
+
+            target["traces"].append(trace)
+            target["n_epochs"] += item["n_epochs"]
+            target["subjects"] += 1
+            target["channels"].append(item["channel"])
+            target.setdefault("channel_types", []).append(item["channel_type"])
+            target["events"].update(item["events"])
+
+    erp = {}
+    for condition, item in collected.items():
+        if item["traces"]:
+            erp[condition] = {
+                "trace": np.mean(np.vstack(item["traces"]), axis=0),
+                "times_ms": item["times_ms"],
+                "n_epochs": item["n_epochs"],
+                "subjects": item["subjects"],
+                "channel": max(set(item["channels"]), key=item["channels"].count),
+                "channel_type": max(set(item["channel_types"]), key=item["channel_types"].count),
+                "events": tuple(sorted(item["events"])),
+            }
+
+    if not erp:
+        return {}, "Epoch files were found, but no condition waveforms could be extracted."
+
+    return erp, None
+
+
+def sanitize_adjacency(A):
+    A = np.asarray(A, dtype=float).copy()
+    A[~np.isfinite(A)] = 0
+    A = (A + A.T) / 2
+    A[A < 0] = 0
+    np.fill_diagonal(A, 0)
+    return A
+
+
+def fiedler_split(A):
+    A = sanitize_adjacency(A)
+    n_nodes = A.shape[0]
+    if n_nodes < 2 or np.allclose(A, 0):
+        return np.zeros(n_nodes, dtype=int)
+
+    L = np.diag(A.sum(axis=1)) - A
+    _, eigenvectors = eigh(L)
+    fvec = eigenvectors[:, 1]
+    labels = (fvec > 0).astype(int)
+
+    if len(np.unique(labels)) < 2:
+        labels = (fvec > np.median(fvec)).astype(int)
+
+    if len(np.unique(labels)) < 2:
+        order = np.argsort(fvec)
+        labels = np.zeros(n_nodes, dtype=int)
+        labels[order[n_nodes // 2 :]] = 1
+
+    return labels
+
+
+def modularity_communities(A, seed=42):
+    A = sanitize_adjacency(A)
+    n_nodes = A.shape[0]
+
+    if n_nodes < 2 or np.allclose(A, 0):
+        return np.zeros(n_nodes, dtype=int), np.nan, "empty graph"
+
+    if nx is None:
+        return fiedler_split(A), np.nan, "Fiedler fallback"
+
+    G = nx.from_numpy_array(A)
+    if G.number_of_edges() == 0:
+        return np.zeros(n_nodes, dtype=int), np.nan, "empty graph"
+
+    try:
+        communities = nx.community.louvain_communities(G, weight="weight", seed=seed)
+        method = "Louvain modularity"
+    except Exception:
+        communities = nx.community.greedy_modularity_communities(G, weight="weight")
+        method = "Greedy modularity"
+
+    communities = [set(community) for community in communities if len(community) > 0]
+    labels = np.zeros(n_nodes, dtype=int)
+    for community_idx, community in enumerate(communities):
+        for node in community:
+            labels[node] = community_idx
+
+    try:
+        score = nx.community.modularity(G, communities, weight="weight")
+    except Exception:
+        score = np.nan
+
+    return labels, float(score), method
+
+
+def graph_feature_matrix(X):
+    _, n_nodes, n_nodes_2, _ = X.shape
+    if n_nodes != n_nodes_2:
+        raise ValueError(f"Expected square connectivity matrices, got shape {X.shape}")
+
+    upper = np.triu_indices(n_nodes, k=1)
+    features = X[:, upper[0], upper[1], :].mean(axis=0).T
+    features = np.asarray(features, dtype=float)
+    features[~np.isfinite(features)] = 0
+
+    std = features.std(axis=0)
+    valid = std > 0
+    features[:, valid] = (features[:, valid] - features[:, valid].mean(axis=0)) / std[valid]
+    features[:, ~valid] = 0
+    return features
+
+
+def segment_sse(prefix_sum, prefix_sq_sum, start, end):
+    n_samples = end - start
+    if n_samples <= 0:
+        return np.inf
+
+    segment_sum = prefix_sum[end] - prefix_sum[start]
+    segment_sq_sum = prefix_sq_sum[end] - prefix_sq_sum[start]
+    return float(segment_sq_sum.sum() - np.square(segment_sum).sum() / n_samples)
+
+
+def detect_change_points_exact(features, n_bkps=N_CHANGE_POINTS, min_size=MIN_INTERVAL_FRAMES):
+    n_times = features.shape[0]
+    n_segments = n_bkps + 1
+    min_size = max(1, min(min_size, n_times // n_segments))
+
+    if n_times < n_segments:
+        return []
+
+    prefix_sum = np.vstack([np.zeros(features.shape[1]), np.cumsum(features, axis=0)])
+    prefix_sq_sum = np.vstack([np.zeros(features.shape[1]), np.cumsum(features * features, axis=0)])
+
+    dp = np.full((n_segments + 1, n_times + 1), np.inf)
+    previous = np.full((n_segments + 1, n_times + 1), -1, dtype=int)
+    dp[0, 0] = 0
+
+    for segment_idx in range(1, n_segments + 1):
+        min_end = segment_idx * min_size
+        max_end = n_times - (n_segments - segment_idx) * min_size
+        for end in range(min_end, max_end + 1):
+            min_start = (segment_idx - 1) * min_size
+            max_start = end - min_size
+            for start in range(min_start, max_start + 1):
+                cost = dp[segment_idx - 1, start] + segment_sse(
+                    prefix_sum,
+                    prefix_sq_sum,
+                    start,
+                    end,
+                )
+                if cost < dp[segment_idx, end]:
+                    dp[segment_idx, end] = cost
+                    previous[segment_idx, end] = start
+
+    if not np.isfinite(dp[n_segments, n_times]):
+        return []
+
+    boundaries = []
+    end = n_times
+    for segment_idx in range(n_segments, 0, -1):
+        start = previous[segment_idx, end]
+        if start <= 0:
+            break
+        boundaries.append(start)
+        end = start
+
+    return sorted(boundaries)
+
+
+def make_intervals_from_change_points(n_times, change_points, names=INTERVAL_NAMES):
+    boundaries = [0]
+    boundaries.extend(int(point) for point in sorted(change_points) if 0 < point < n_times)
+    boundaries.append(n_times)
+
+    if len(boundaries) != len(names) + 1:
+        splits = np.array_split(np.arange(n_times), len(names))
+        return {
+            name: frames
+            for name, frames in zip(names, splits)
+            if len(frames) > 0
+        }
+
+    return {
+        name: np.arange(start, end)
+        for name, start, end in zip(names, boundaries[:-1], boundaries[1:])
+        if end > start
+    }
+
+
+@st.cache_data(show_spinner=False)
+def make_change_point_intervals_cached(X):
+    intervals, change_points, method = analysis.make_change_point_intervals(X)
+    return intervals, change_points, method
+
+
+def frames_to_ms(n_times, start_ms=-1000.0, end_ms=1000.0):
+    return np.linspace(start_ms, end_ms, n_times)
+
+
+def channel_labels(n_nodes):
+    return [f"Ch{idx:02d}" for idx in range(1, n_nodes + 1)]
+
+
+def mean_connectivity_trace(X):
+    _, n_nodes, _, _ = X.shape
+    upper = np.triu_indices(n_nodes, k=1)
+    trace = X[:, upper[0], upper[1], :].mean(axis=(0, 1))
+    std = trace.std()
+    if std > 0:
+        return (trace - trace.mean()) / std
+    return trace - trace.mean()
+
+
+def smooth_trace(trace, window):
+    if window <= 1 or len(trace) < window:
+        return trace
+
+    if window % 2 == 0:
+        window += 1
+
+    kernel = np.ones(window) / window
+    pad = window // 2
+    padded = np.pad(trace, pad, mode="edge")
+    return np.convolve(padded, kernel, mode="valid")
+
+
+def interval_mean_adjacency(X, frames):
+    A = X[:, :, :, frames].mean(axis=(0, 3))
+    return sanitize_adjacency(A)
+
+
+def threshold_adjacency(A, mode, edge_percent):
+    A = sanitize_adjacency(A)
+
+    if mode == "dyconnmap OMST" and HAS_DYCONNMAP:
+        try:
+            with warnings.catch_warnings():
+                warnings.filterwarnings(
+                    "ignore",
+                    message="divide by zero encountered in divide",
+                    category=RuntimeWarning,
+                )
+                _, thresholded, *_ = threshold_omst_global_cost_efficiency(A)
+            return sanitize_adjacency(thresholded), "dyconnmap OMST"
+        except Exception as exc:
+            st.warning(f"dyconnmap threshold failed; using top edges instead. {exc}")
+
+    upper_idx = np.triu_indices_from(A, k=1)
+    weights = A[upper_idx]
+    positive = weights[weights > 0]
+    thresholded = np.zeros_like(A)
+
+    if len(positive) == 0:
+        return thresholded, "empty graph"
+
+    keep_fraction = max(edge_percent, 1) / 100.0
+    cutoff = np.quantile(positive, 1 - keep_fraction)
+    thresholded[A >= cutoff] = A[A >= cutoff]
+    thresholded = sanitize_adjacency(thresholded)
+    return thresholded, f"top {edge_percent:.0f}% edges"
+
+
+def get_interval_labels(condition, intervals):
+    if condition == "incorrect":
+        return ("PRE-ERN", "ERN", "POST-ERN")
+    if condition == "correct":
+        return ("PRE-CRN", "CRN", "POST-CRN")
+    return ("PRE", "EVENT", "POST")
+
+
+def draw_interval_labels(ax, intervals, times_ms, condition):
+    interval_values = list(intervals.values())
+    for frames in interval_values[1:]:
+        ax.axvline(times_ms[frames[0]], color="#6075ff", linewidth=1.4, alpha=0.85)
+
+    labels = get_interval_labels(condition, intervals)
+    label_frames = [
+        intervals[name]
+        for name in INTERVAL_NAMES
+        if name in intervals
+    ]
+
+    y_min, y_max = ax.get_ylim()
+    y_pos = y_max - 0.12 * (y_max - y_min)
+    for text, frames in zip(labels, label_frames):
+        center = int(round((frames[0] + frames[-1]) / 2))
+        ax.text(
+            times_ms[center],
+            y_pos,
+            text,
+            ha="center",
+            va="top",
+            fontsize=10,
+            fontweight="bold",
+        )
+
+
+def plot_timecourses(tensors, smooth_window, erp_traces=None, use_low_rank=False):
+    fig, axes = plt.subplots(len(tensors), 1, figsize=(11, 5.8), sharex=True)
+    axes = np.atleast_1d(axes)
+
+    for idx, (condition, X) in enumerate(tensors.items()):
+        n_times = X.shape[-1]
+        tensor_times_ms = frames_to_ms(n_times)
+        change_point_tensor = load_analysis_tensor(str(TENSOR_FILES[condition]), use_low_rank)
+        intervals, change_points, change_point_method = make_change_point_intervals_cached(change_point_tensor)
+        erp = erp_traces.get(condition) if erp_traces else None
+
+        if erp is not None:
+            times_ms = erp["times_ms"]
+            trace = smooth_trace(erp["trace"], smooth_window)
+            ylabel = "amplitude (uV)" if erp["channel_type"] == "eeg" else "baseline-corrected CSD"
+            event_name = "ERN" if condition == "incorrect" else "CRN"
+            title = (
+                f"({chr(97 + idx)}) Average {event_name} waveform "
+                f"({erp['subjects']} subjects, {erp['n_epochs']} epochs, {erp['channel']}, {erp['channel_type']})"
+            )
+        else:
+            times_ms = tensor_times_ms
+            trace = smooth_trace(mean_connectivity_trace(X), smooth_window)
+            ylabel = "z(mean PLV)"
+            title = (
+                f"({chr(97 + idx)}) {condition.capitalize()} tensor: "
+                f"{X.shape[0]} subjects, {X.shape[1]} nodes, {n_times} windows"
+            )
+
+        ax = axes[idx]
+        ax.plot(times_ms, trace, color="red", linewidth=1.8)
+        ax.axhline(0, color="0.65", linewidth=0.8)
+        ax.set_xlim(-1000, 1000)
+        ax.set_ylabel(ylabel)
+        ax.set_title(title, loc="left")
+        draw_interval_labels(ax, intervals, tensor_times_ms, condition)
+        for point in change_points:
+            ax.text(
+                tensor_times_ms[point],
+                ax.get_ylim()[1],
+                f"{tensor_times_ms[point]:.0f}ms",
+                ha="center",
+                va="bottom",
+                fontsize=9,
+                fontweight="bold",
+            )
+        ax.text(
+            0.99,
+            0.08,
+            f"{change_point_method}: frames {change_points}",
+            transform=ax.transAxes,
+            ha="right",
+            va="bottom",
+            fontsize=8,
+            color="0.25",
+        )
+        ax.tick_params(direction="in", top=True, right=True)
+        ax.spines["top"].set_visible(True)
+        ax.spines["right"].set_visible(True)
+
+    axes[-1].set_xlabel("time (ms)")
+    fig.tight_layout()
+    return fig
+
+
+def plot_heatmap(A, labels=None, sort_by_community=True, title="Connectivity Matrix"):
+    A = sanitize_adjacency(A)
+    order = np.arange(A.shape[0])
+    if labels is not None and sort_by_community:
+        order = np.argsort(labels)
+        A = A[np.ix_(order, order)]
+
+    fig, ax = plt.subplots(figsize=(6.6, 5.8))
+    im = ax.imshow(A, cmap="viridis", interpolation="nearest")
+    ax.set_title(title)
+    ax.set_xlabel("Node")
+    ax.set_ylabel("Node")
+    ax.set_xticks(np.arange(A.shape[0]))
+    ax.set_yticks(np.arange(A.shape[0]))
+    ax.set_xticklabels([str(idx + 1) for idx in order], rotation=90, fontsize=7)
+    ax.set_yticklabels([str(idx + 1) for idx in order], fontsize=7)
+    fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+    fig.tight_layout()
+    return fig
+
+
+def plot_circular_network(A, labels, threshold_mode, edge_percent, show_node_labels):
+    A_thr, threshold_label = threshold_adjacency(A, threshold_mode, edge_percent)
+    n_nodes = A_thr.shape[0]
+    theta = np.linspace(0, 2 * np.pi, n_nodes, endpoint=False)
+    xy = np.column_stack([np.cos(theta), np.sin(theta)])
+    max_weight = A_thr.max() if A_thr.max() > 0 else 1.0
+
+    fig, ax = plt.subplots(figsize=(6.6, 6.2))
+
+    for i in range(n_nodes):
+        for j in range(i + 1, n_nodes):
+            weight = A_thr[i, j]
+            if weight <= 0:
+                continue
+            scaled = weight / max_weight
+            ax.plot(
+                [xy[i, 0], xy[j, 0]],
+                [xy[i, 1], xy[j, 1]],
+                color="0.2",
+                alpha=0.15 + 0.65 * scaled,
+                linewidth=0.4 + 2.4 * scaled,
+                zorder=1,
+            )
+
+    node_colors = plt.cm.Set2(labels / max(labels.max(), 1))
+    ax.scatter(
+        xy[:, 0],
+        xy[:, 1],
+        c=node_colors,
+        s=110,
+        edgecolors="white",
+        linewidths=1.0,
+        zorder=3,
+    )
+
+    if show_node_labels:
+        for idx, (x_pos, y_pos) in enumerate(xy):
+            ax.text(
+                x_pos * 1.14,
+                y_pos * 1.14,
+                str(idx + 1),
+                ha="center",
+                va="center",
+                fontsize=7,
+            )
+
+    ax.set_title(f"Circular Connectivity Graph\n{threshold_label}")
+    ax.set_aspect("equal")
+    ax.axis("off")
+    fig.tight_layout()
+    return fig, A_thr
+
+
+def node_metric_table(A, labels, A_thr):
+    names = channel_labels(A.shape[0])
+    return pd.DataFrame(
+        {
+            "channel": names,
+            "community": labels.astype(int),
+            "strength": A.sum(axis=1),
+            "thresholded_degree": (A_thr > 0).sum(axis=1),
+            "thresholded_strength": A_thr.sum(axis=1),
+        }
+    )
+
+
+def load_available_tensors():
+    tensors = {}
+    missing = []
+    for condition, path in TENSOR_FILES.items():
+        if path.exists():
+            tensors[condition] = load_tensor(str(path))
+        else:
+            missing.append(path)
+    return tensors, missing
+
+
+def get_fcca_interval_matrix(results, interval_name, source):
+    if source == "FCCA consensus matrix":
+        matrix_key = f"{interval_name}_consensus_matrix"
+    elif source == "FCCA mean adjacency":
+        matrix_key = f"{interval_name}_mean_adjacency"
+    else:
+        return None, None
+
+    label_key = f"{interval_name}_consensus_labels"
+    matrix = results.get(matrix_key)
+    labels = results.get(label_key)
+    return matrix, labels
+
+
+def main():
+    st.title("Brain Connectivity Explorer")
+    st.caption("Interactive views for 4D connectivity tensors and interval-wise FCCA outputs.")
+
+    tensors, missing = load_available_tensors()
+    results = load_fcca_results(str(RESULTS_FILE))
+    erp_traces, erp_error = load_analysis_erp_traces(tuple(tensors.keys()))
+
+    if not tensors:
+        st.error("No tensor files were found in tensor_4d/.")
+        st.stop()
+
+    with st.sidebar:
+        st.header("Controls")
+        condition = st.selectbox("Condition", list(tensors.keys()), index=0)
+        use_low_rank = st.checkbox(
+            "Use Tucker low-rank tensor",
+            value=True,
+            help="Matches the cleaned tensor used by tensor_de_v2.py for FCCA.",
+        )
+        analysis_tensor = load_analysis_tensor(str(TENSOR_FILES[condition]), use_low_rank)
+        n_times = analysis_tensor.shape[-1]
+        intervals, change_points, change_point_method = make_change_point_intervals_cached(analysis_tensor)
+        interval_name = st.selectbox("Interval", list(intervals.keys()), index=1)
+        matrix_source = st.radio(
+            "Matrix source",
+            ("FCCA consensus matrix", "FCCA mean adjacency", "Tensor interval mean"),
+            index=0,
+        )
+        threshold_modes = ["Top weighted edges"]
+        if HAS_DYCONNMAP:
+            threshold_modes.insert(0, "dyconnmap OMST")
+        threshold_mode = st.selectbox("Graph threshold", threshold_modes)
+        edge_percent = st.slider("Top-edge percentage", 5, 100, 20, 5)
+        smooth_window = st.slider("Time-course smoothing window", 1, 31, 7, 2)
+        sort_heatmap = st.checkbox("Sort heatmap by community", value=True)
+        show_node_labels = st.checkbox("Show node labels", value=True)
+
+    selected_tensor = analysis_tensor
+    selected_frames = intervals[interval_name]
+
+    tabs = st.tabs(["Time Course", "Interval Network", "Subject/Time Graph", "Data"])
+
+    with tabs[0]:
+        st.subheader("Average ERN/CRN Waveform with Connectivity Change Points")
+        st.pyplot(
+            plot_timecourses(tensors, smooth_window, erp_traces, use_low_rank=use_low_rank),
+            clear_figure=True,
+        )
+        if erp_error:
+            st.warning(
+                f"{erp_error} Falling back to z-scored mean connectivity for the red trace."
+            )
+        else:
+            st.info(
+                "The red trace uses the same ERP loading pipeline as tensor_de_v2.py "
+                "(raw BIDS first, then FIF fallback). The blue lines are tensor change points."
+            )
+
+    with tabs[1]:
+        st.subheader("Interval Connectivity")
+
+        matrix = None
+        labels = None
+        modularity_score = None
+        community_method = None
+        if matrix_source != "Tensor interval mean":
+            use_saved_fcca = condition == "incorrect" and use_low_rank
+            if use_saved_fcca:
+                matrix, labels = get_fcca_interval_matrix(results, interval_name, matrix_source)
+
+            if matrix is None:
+                interval_result = run_fcca_interval_cached(
+                    str(TENSOR_FILES[condition]),
+                    tuple(int(frame) for frame in selected_frames),
+                    use_low_rank,
+                )
+                matrix = (
+                    interval_result["consensus_matrix"]
+                    if matrix_source == "FCCA consensus matrix"
+                    else interval_result["mean_adjacency"]
+                )
+                labels = interval_result["consensus_labels"]
+                modularity_score = float(interval_result["consensus_modularity"])
+                community_method = str(np.asarray(interval_result["community_method"]).item())
+                st.info(
+                    "FCCA was computed in Streamlit with the same run_fcca_interval() "
+                    "function used by tensor_de_v2.py."
+                )
+
+        if matrix is None:
+            matrix = interval_mean_adjacency(selected_tensor, selected_frames)
+            labels, modularity_score, community_method = analysis.modularity_communities(matrix)
+        else:
+            matrix = sanitize_adjacency(matrix)
+            if labels is not None:
+                labels = labels.astype(int)
+                if modularity_score is None:
+                    score_key = f"{interval_name}_consensus_modularity"
+                    modularity_score = results.get(score_key, np.asarray(np.nan))
+                    modularity_score = float(np.asarray(modularity_score))
+                    method_key = f"{interval_name}_community_method"
+                    community_method = str(np.asarray(results.get(method_key, "saved FCCA labels")).item())
+            else:
+                labels, modularity_score, community_method = analysis.modularity_communities(matrix)
+
+        col_a, col_b = st.columns(2)
+        with col_a:
+            st.pyplot(
+                plot_heatmap(
+                    matrix,
+                    labels=labels,
+                    sort_by_community=sort_heatmap,
+                    title=f"{interval_name} | {matrix_source}",
+                ),
+                clear_figure=True,
+            )
+        with col_b:
+            network_fig, A_thr = plot_circular_network(
+                matrix,
+                labels,
+                threshold_mode,
+                edge_percent,
+                show_node_labels,
+            )
+            st.pyplot(network_fig, clear_figure=True)
+
+        metric_cols = st.columns(6)
+        metric_cols[0].metric("Frames", f"{selected_frames[0]}-{selected_frames[-1]}")
+        metric_cols[1].metric("Graphs in interval", selected_tensor.shape[0] * len(selected_frames))
+        metric_cols[2].metric("Mean weight", f"{matrix[np.triu_indices_from(matrix, 1)].mean():.4f}")
+        metric_cols[3].metric("Thresholded edges", int(np.count_nonzero(np.triu(A_thr, 1))))
+        metric_cols[4].metric("Communities", len(np.unique(labels)))
+        metric_cols[5].metric(
+            "Modularity",
+            "n/a" if not np.isfinite(modularity_score) else f"{modularity_score:.3f}",
+            help=community_method,
+        )
+
+        st.dataframe(
+            node_metric_table(matrix, labels, A_thr).sort_values(
+                ["community", "thresholded_strength"], ascending=[True, False]
+            ),
+            use_container_width=True,
+            hide_index=True,
+        )
+
+    with tabs[2]:
+        st.subheader("Single Subject and Time Window")
+        max_subject = selected_tensor.shape[0] - 1
+        max_time = selected_tensor.shape[-1] - 1
+        col_controls, col_time = st.columns([1, 2])
+
+        with col_controls:
+            subject_idx = st.slider("Subject index", 0, max_subject, 0)
+            time_idx = st.slider("Time window", 0, max_time, int(selected_frames[0]))
+            time_ms = frames_to_ms(selected_tensor.shape[-1])[time_idx]
+            st.metric("Approx. time", f"{time_ms:.1f} ms")
+
+        A_subject = sanitize_adjacency(selected_tensor[subject_idx, :, :, time_idx])
+        subject_labels, subject_modularity, subject_method = analysis.modularity_communities(A_subject)
+
+        with col_time:
+            st.pyplot(
+                plot_heatmap(
+                    A_subject,
+                    labels=subject_labels,
+                    sort_by_community=sort_heatmap,
+                    title=f"{condition} | subject {subject_idx + 1} | window {time_idx}",
+                ),
+                clear_figure=True,
+            )
+
+        graph_fig, A_subject_thr = plot_circular_network(
+            A_subject,
+            subject_labels,
+            threshold_mode,
+            edge_percent,
+            show_node_labels,
+        )
+        st.pyplot(graph_fig, clear_figure=True)
+        st.caption(
+            f"Community split: {subject_method}; "
+            f"modularity={'n/a' if not np.isfinite(subject_modularity) else f'{subject_modularity:.3f}'}; "
+            f"communities={len(np.unique(subject_labels))}"
+        )
+        st.dataframe(
+            node_metric_table(A_subject, subject_labels, A_subject_thr),
+            use_container_width=True,
+            hide_index=True,
+        )
+
+    with tabs[3]:
+        st.subheader("Loaded Data")
+        tensor_table = pd.DataFrame(
+            [
+                {
+                    "condition": name,
+                    "path": str(TENSOR_FILES[name]),
+                    "shape": " x ".join(map(str, tensor.shape)),
+                }
+                for name, tensor in tensors.items()
+            ]
+        )
+        st.dataframe(tensor_table, use_container_width=True, hide_index=True)
+
+        if missing:
+            st.warning("Missing tensor files: " + ", ".join(str(path) for path in missing))
+
+        st.write("FCCA results file:", str(RESULTS_FILE))
+        st.write("FCCA keys:", sorted(results.keys()) if results else "No FCCA result file found.")
+        st.write("EEG epoch directory:", str(EPOCH_DIR))
+        st.write("Raw BIDS EEG directory:", str(RAW_BIDS_DIR))
+        st.write("Analysis tensor:", "Tucker low-rank" if use_low_rank else "raw tensor")
+        st.write("Change-point method:", change_point_method)
+        if erp_traces:
+            erp_table = pd.DataFrame(
+                [
+                    {
+                        "condition": condition_name,
+                        "subjects": erp["subjects"],
+                        "epochs": erp["n_epochs"],
+                        "channel": erp["channel"],
+                        "channel type": erp["channel_type"],
+                        "events used": ", ".join(erp["events"]),
+                    }
+                    for condition_name, erp in erp_traces.items()
+                ]
+            )
+            st.dataframe(erp_table, use_container_width=True, hide_index=True)
+        elif erp_error:
+            st.warning(erp_error)
+
+        existing_figure = FIGURE_DIR / "incorrect_correct_tensor_timecourses.png"
+        if existing_figure.exists():
+            st.image(str(existing_figure), caption="Saved paper-style time-course figure")
+
+
+if __name__ == "__main__":
+    main()
