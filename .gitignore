@@ -1,3 +1,7 @@
-ERN_Raw_Data_BIDS-Compatible/
+fcca_results/
 tensor_4d/
 fcca
+__pycache__/*
+*.npz
+ERN_Raw_Data_BIDS-Compatible/
+ERN Raw Data BIDS-Compatible/

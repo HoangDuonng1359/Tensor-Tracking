@@ -39,12 +39,22 @@ TENSOR_FILES = {
     for condition, path in analysis.CONDITION_FILES.items()
 }
 RESULTS_FILE = ROOT / analysis.OUTPUT_DIR / "fcca_results.npz"
+HO_RLSL_RESULTS_FILE = ROOT / analysis.HO_RLSL_RESULTS_FILE
+HO_RLSL_FCCA_RESULTS_FILE = ROOT / analysis.HO_RLSL_FCCA_RESULTS_FILE
 FIGURE_DIR = ROOT / analysis.FIGURE_DIR
 EPOCH_DIR = ROOT / analysis.EPOCH_DIR
 RAW_BIDS_DIR = ROOT / analysis.RAW_BIDS_DIR
+RAW_BIDS_DIR_ALIASES = (
+    RAW_BIDS_DIR,
+    ROOT / "ERN Raw Data BIDS-Compatible",
+    ROOT / "ERN_Raw_Data_BIDS-Compatible",
+)
 INTERVAL_NAMES = analysis.INTERVAL_NAMES
 N_CHANGE_POINTS = analysis.N_CHANGE_POINTS
 MIN_INTERVAL_FRAMES = analysis.MIN_INTERVAL_FRAMES
+ADAPTIVE_RECURSIVE_MODULARITY_TOLERANCE = analysis.ADAPTIVE_RECURSIVE_MODULARITY_TOLERANCE
+CORE_INTERVAL_NAMES = analysis.CORE_INTERVAL_NAMES
+COMPACT_INTERVAL_NAMES = analysis.COMPACT_INTERVAL_NAMES
 PREFERRED_ERP_CHANNELS = analysis.PREFERRED_ERP_CHANNELS
 ERP_BASELINE_MS = analysis.ERP_BASELINE_MS
 TUCKER_RANK = analysis.TUCKER_RANK
@@ -63,13 +73,38 @@ def load_tensor(path_str):
 
 
 @st.cache_data(show_spinner="Running Tucker low-rank decomposition...")
-def load_analysis_tensor(path_str, use_low_rank):
+def load_analysis_tensor(path_str, low_rank_method):
     X = np.load(path_str)
-    if not use_low_rank:
+    if low_rank_method == "Raw tensor":
         return X
+
+    if low_rank_method == "Ho-RLSL saved low-rank":
+        with np.load(HO_RLSL_RESULTS_FILE, allow_pickle=True) as npz:
+            if "low_rank" not in npz.files:
+                raise ValueError(
+                    "Ho-RLSL result file exists but does not contain low_rank. "
+                    "Run tensor_de_v2.py with --low-rank-method ho-rlsl --save-ho-rlsl-tensors."
+                )
+            L = npz["low_rank"]
+        if L.shape != X.shape:
+            raise ValueError(f"Saved Ho-RLSL low_rank shape {L.shape} does not match tensor shape {X.shape}.")
+        return L
 
     L, _, _, _ = analysis.tucker_low_rank_decomposition(X, rank=TUCKER_RANK)
     return L
+
+
+@st.cache_data(show_spinner=False)
+def has_saved_ho_rlsl_low_rank(path_str):
+    path = Path(path_str)
+    if not HO_RLSL_RESULTS_FILE.exists() or not path.exists():
+        return False
+    try:
+        tensor_shape = np.load(path, mmap_mode="r").shape
+        with np.load(HO_RLSL_RESULTS_FILE, allow_pickle=True) as npz:
+            return "low_rank" in npz.files and npz["low_rank"].shape == tensor_shape
+    except Exception:
+        return False
 
 
 @st.cache_data(show_spinner=False)
@@ -80,6 +115,51 @@ def load_fcca_results(path_str):
 
     with np.load(path, allow_pickle=True) as npz:
         return {key: npz[key] for key in npz.files}
+
+
+def find_electrodes_file():
+    for root in RAW_BIDS_DIR_ALIASES:
+        if not root.exists():
+            continue
+        matches = sorted(root.glob("sub-*/eeg/*_task-ERN_electrodes.tsv"))
+        if matches:
+            return matches[0]
+    return None
+
+
+@st.cache_data(show_spinner=False)
+def load_electrode_layout(n_nodes):
+    electrodes_file = find_electrodes_file()
+    if electrodes_file is None:
+        return None
+
+    electrodes = pd.read_csv(electrodes_file, sep="\t")
+    required = {"name", "x", "y"}
+    if not required.issubset(electrodes.columns):
+        return None
+
+    electrodes = electrodes.iloc[:n_nodes].copy()
+    if len(electrodes) != n_nodes:
+        return None
+
+    for column in ("x", "y"):
+        electrodes[column] = pd.to_numeric(electrodes[column], errors="coerce")
+    electrodes = electrodes.dropna(subset=["x", "y"])
+    if len(electrodes) != n_nodes:
+        return None
+
+    # BIDS coordinates here use x for anterior-posterior and y for left-right.
+    # Plot with left on the left side of the screen and frontal channels on top.
+    plot_x = -electrodes["y"].to_numpy(dtype=float)
+    plot_y = electrodes["x"].to_numpy(dtype=float)
+    plot_x = plot_x / max(np.max(np.abs(plot_x)), 1.0)
+    plot_y = plot_y / max(np.max(np.abs(plot_y)), 1.0)
+
+    return {
+        "names": electrodes["name"].astype(str).tolist(),
+        "xy": np.column_stack([plot_x, plot_y]),
+        "source": str(electrodes_file),
+    }
 
 
 @st.cache_data(show_spinner="Loading ERP traces with tensor_de_v2 pipeline...")
@@ -95,9 +175,9 @@ def load_analysis_erp_traces(conditions):
 
 
 @st.cache_data(show_spinner="Running FCCA interval analysis...")
-def run_fcca_interval_cached(path_str, frames_tuple, use_low_rank):
-    X = load_analysis_tensor(path_str, use_low_rank)
-    return analysis.run_fcca_interval(X, np.asarray(frames_tuple, dtype=int))
+def run_fcca_interval_cached(path_str, frames_tuple, low_rank_method, interval_name):
+    X = load_analysis_tensor(path_str, low_rank_method)
+    return analysis.run_fcca_interval(X, np.asarray(frames_tuple, dtype=int), interval_name=interval_name)
 
 
 def condition_event_names(epochs, condition):
@@ -272,19 +352,125 @@ def fiedler_split(A):
     return labels
 
 
-def modularity_communities(A, seed=42):
+def labels_to_communities(labels):
+    labels = np.asarray(labels, dtype=int)
+    return [
+        set(np.flatnonzero(labels == label).tolist())
+        for label in sorted(np.unique(labels))
+    ]
+
+
+def partition_to_labels(partition, n_nodes):
+    labels = np.zeros(n_nodes, dtype=int)
+    ordered = sorted((sorted(group) for group in partition if group), key=lambda group: group[0])
+    for label, group in enumerate(ordered):
+        labels[np.asarray(group, dtype=int)] = label
+    return labels
+
+
+def weighted_modularity(A, labels):
+    A = sanitize_adjacency(A)
+    labels = np.asarray(labels, dtype=int)
+    total_weight = A.sum() / 2.0
+    if total_weight <= 0:
+        return np.nan
+
+    degrees = A.sum(axis=1)
+    score = 0.0
+    for label in np.unique(labels):
+        nodes = np.flatnonzero(labels == label)
+        internal_weight = A[np.ix_(nodes, nodes)].sum() / 2.0
+        degree_sum = degrees[nodes].sum()
+        score += internal_weight / total_weight - (degree_sum / (2.0 * total_weight)) ** 2
+    return float(score)
+
+
+def recursive_fiedler_communities(A, min_size=3, min_gain=1e-4):
+    A = sanitize_adjacency(A)
+    n_nodes = A.shape[0]
+    partition = [list(range(n_nodes))]
+
+    changed = True
+    while changed:
+        changed = False
+        best_gain = min_gain
+        best_index = None
+        best_split = None
+
+        for idx, nodes in enumerate(partition):
+            if len(nodes) < 2 * min_size:
+                continue
+
+            subA = A[np.ix_(nodes, nodes)]
+            sublabels = fiedler_split(subA)
+            if len(np.unique(sublabels)) < 2:
+                continue
+
+            left = [nodes[i] for i in np.flatnonzero(sublabels == 0)]
+            right = [nodes[i] for i in np.flatnonzero(sublabels == 1)]
+            if len(left) < min_size or len(right) < min_size:
+                continue
+
+            gain = weighted_modularity(subA, sublabels)
+            if np.isfinite(gain) and gain > best_gain:
+                best_gain = gain
+                best_index = idx
+                best_split = [left, right]
+
+        if best_index is not None and best_split is not None:
+            partition = partition[:best_index] + best_split + partition[best_index + 1 :]
+            changed = True
+
+    labels = partition_to_labels(partition, n_nodes)
+    return labels, weighted_modularity(A, labels), "Adaptive recursive Fiedler"
+
+
+def communities_to_labels(communities, n_nodes):
+    labels = np.zeros(n_nodes, dtype=int)
+    for community_idx, community in enumerate(communities):
+        for node in community:
+            labels[node] = community_idx
+    return labels
+
+
+def clustering_profile_for_interval(interval_name=None):
+    if interval_name in CORE_INTERVAL_NAMES:
+        return "detailed"
+    if interval_name in COMPACT_INTERVAL_NAMES:
+        return "compact"
+    return "balanced"
+
+
+def modularity_communities(A, seed=42, clustering_profile="balanced"):
     A = sanitize_adjacency(A)
     n_nodes = A.shape[0]
 
     if n_nodes < 2 or np.allclose(A, 0):
         return np.zeros(n_nodes, dtype=int), np.nan, "empty graph"
 
+    if clustering_profile == "detailed":
+        recursive_tolerance = 0.08
+        recursive_min_size = 3
+    elif clustering_profile == "compact":
+        recursive_tolerance = 0.0
+        recursive_min_size = 6
+    else:
+        recursive_tolerance = ADAPTIVE_RECURSIVE_MODULARITY_TOLERANCE
+        recursive_min_size = 3
+
+    recursive_labels, recursive_score, recursive_method = recursive_fiedler_communities(
+        A,
+        min_size=recursive_min_size,
+    )
+
     if nx is None:
-        return fiedler_split(A), np.nan, "Fiedler fallback"
+        return recursive_labels, recursive_score, recursive_method
 
     G = nx.from_numpy_array(A)
     if G.number_of_edges() == 0:
         return np.zeros(n_nodes, dtype=int), np.nan, "empty graph"
+
+    candidates = [(recursive_labels, recursive_score, recursive_method)]
 
     try:
         communities = nx.community.louvain_communities(G, weight="weight", seed=seed)
@@ -294,17 +480,27 @@ def modularity_communities(A, seed=42):
         method = "Greedy modularity"
 
     communities = [set(community) for community in communities if len(community) > 0]
-    labels = np.zeros(n_nodes, dtype=int)
-    for community_idx, community in enumerate(communities):
-        for node in community:
-            labels[node] = community_idx
+    labels = communities_to_labels(communities, n_nodes)
 
     try:
         score = nx.community.modularity(G, communities, weight="weight")
     except Exception:
         score = np.nan
+    candidates.append((labels, float(score), method))
 
-    return labels, float(score), method
+    finite_candidates = [
+        candidate for candidate in candidates if np.isfinite(candidate[1])
+    ]
+    if not finite_candidates:
+        return recursive_labels, recursive_score, recursive_method
+
+    best_labels, best_score, best_method = max(finite_candidates, key=lambda item: item[1])
+    recursive_k = len(np.unique(recursive_labels))
+    best_k = len(np.unique(best_labels))
+    if recursive_k > best_k and recursive_score >= best_score - recursive_tolerance:
+        return recursive_labels, float(recursive_score), recursive_method
+
+    return best_labels, float(best_score), best_method
 
 
 def graph_feature_matrix(X):
@@ -412,6 +608,9 @@ def frames_to_ms(n_times, start_ms=-1000.0, end_ms=1000.0):
 
 
 def channel_labels(n_nodes):
+    layout = load_electrode_layout(n_nodes)
+    if layout is not None:
+        return layout["names"]
     return [f"Ch{idx:02d}" for idx in range(1, n_nodes + 1)]
 
 
@@ -509,14 +708,14 @@ def draw_interval_labels(ax, intervals, times_ms, condition):
         )
 
 
-def plot_timecourses(tensors, smooth_window, erp_traces=None, use_low_rank=False):
+def plot_timecourses(tensors, smooth_window, erp_traces=None, low_rank_method="Tucker low-rank"):
     fig, axes = plt.subplots(len(tensors), 1, figsize=(11, 5.8), sharex=True)
     axes = np.atleast_1d(axes)
 
     for idx, (condition, X) in enumerate(tensors.items()):
         n_times = X.shape[-1]
         tensor_times_ms = frames_to_ms(n_times)
-        change_point_tensor = load_analysis_tensor(str(TENSOR_FILES[condition]), use_low_rank)
+        change_point_tensor = load_analysis_tensor(str(TENSOR_FILES[condition]), low_rank_method)
         intervals, change_points, change_point_method = make_change_point_intervals_cached(change_point_tensor)
         erp = erp_traces.get(condition) if erp_traces else None
 
@@ -595,12 +794,173 @@ def plot_heatmap(A, labels=None, sort_by_community=True, title="Connectivity Mat
     return fig
 
 
+def draw_head_outline(ax, xy):
+    center = xy.mean(axis=0)
+    radius = max(np.max(np.linalg.norm(xy - center, axis=1)) * 1.08, 1.0)
+    theta = np.linspace(0, 2 * np.pi, 240)
+    ax.plot(
+        center[0] + radius * np.cos(theta),
+        center[1] + radius * np.sin(theta),
+        color="0.35",
+        linewidth=1.0,
+        zorder=0,
+    )
+    ax.plot(
+        [center[0] - 0.10 * radius, center[0], center[0] + 0.10 * radius],
+        [center[1] + radius, center[1] + 1.12 * radius, center[1] + radius],
+        color="0.35",
+        linewidth=1.0,
+        zorder=0,
+    )
+
+
+COMMUNITY_PALETTE = (
+    "#1f77b4",
+    "#d62728",
+    "#2ca02c",
+    "#9467bd",
+    "#ff7f0e",
+    "#17becf",
+    "#e377c2",
+    "#8c564b",
+    "#bcbd22",
+    "#7f7f7f",
+)
+
+
+def community_color_map(labels):
+    if labels is None:
+        return {}
+    labels = np.asarray(labels, dtype=int)
+    communities = sorted(int(label) for label in np.unique(labels))
+    return {
+        community: COMMUNITY_PALETTE[idx % len(COMMUNITY_PALETTE)]
+        for idx, community in enumerate(communities)
+    }
+
+
+def community_node_colors(labels, n_nodes):
+    if labels is None:
+        return ["#ff8c1a"] * n_nodes
+    labels = np.asarray(labels, dtype=int)
+    colors = community_color_map(labels)
+    return [colors[int(label)] for label in labels]
+
+
+def community_edge_style(i, j, labels):
+    if labels is None:
+        return "0.35", 0.35, 1.0
+
+    labels = np.asarray(labels, dtype=int)
+    color_map = community_color_map(labels)
+    if labels[i] == labels[j]:
+        return color_map[int(labels[i])], 0.58, 1.35
+    return "0.70", 0.22, 0.70
+
+
+def community_legend_handles(labels):
+    colors = community_color_map(labels)
+    return [
+        plt.Line2D(
+            [0],
+            [0],
+            marker="o",
+            color="white",
+            markerfacecolor=color,
+            markeredgecolor="white",
+            markersize=8,
+            linewidth=0,
+            label=f"community {community}",
+        )
+        for community, color in colors.items()
+    ]
+
+
+def add_network_legend(ax, labels):
+    handles = community_legend_handles(labels)
+    if not handles:
+        return
+    ax.legend(
+        handles=handles,
+        title="communities",
+        loc="lower left",
+        bbox_to_anchor=(0.0, 0.0),
+        frameon=False,
+        fontsize=8,
+        title_fontsize=8,
+    )
+
+
+def plot_electrode_network(A, labels, threshold_mode, edge_percent, show_node_labels):
+    A_thr, threshold_label = threshold_adjacency(A, threshold_mode, edge_percent)
+    n_nodes = A_thr.shape[0]
+    layout = load_electrode_layout(n_nodes)
+    if layout is None:
+        return plot_circular_network(A, labels, threshold_mode, edge_percent, show_node_labels)
+
+    xy = layout["xy"]
+    names = layout["names"]
+    node_colors = community_node_colors(labels, n_nodes)
+
+    fig, ax = plt.subplots(figsize=(6.6, 6.2))
+    draw_head_outline(ax, xy)
+
+    for i in range(n_nodes):
+        for j in range(i + 1, n_nodes):
+            weight = A_thr[i, j]
+            if weight <= 0:
+                continue
+            color, alpha, linewidth = community_edge_style(i, j, labels)
+            ax.plot(
+                [xy[i, 0], xy[j, 0]],
+                [xy[i, 1], xy[j, 1]],
+                color=color,
+                alpha=alpha,
+                linewidth=linewidth,
+                zorder=1,
+            )
+
+    ax.scatter(
+        xy[:, 0],
+        xy[:, 1],
+        c=node_colors,
+        s=76,
+        edgecolors="white",
+        linewidths=1.0,
+        zorder=3,
+    )
+
+    if show_node_labels:
+        for idx, (x_pos, y_pos) in enumerate(xy):
+            ax.text(
+                x_pos,
+                y_pos,
+                names[idx],
+                ha="center",
+                va="center",
+                fontsize=8,
+                fontweight="bold",
+                color="black",
+                zorder=4,
+            )
+
+    ax.set_title(f"Scalp Connectivity Graph\n{threshold_label}")
+    add_network_legend(ax, labels)
+    ax.set_aspect("equal")
+    ax.axis("off")
+    pad_x = max((xy[:, 0].max() - xy[:, 0].min()) * 0.12, 0.12)
+    pad_y = max((xy[:, 1].max() - xy[:, 1].min()) * 0.15, 0.15)
+    ax.set_xlim(xy[:, 0].min() - pad_x, xy[:, 0].max() + pad_x)
+    ax.set_ylim(xy[:, 1].min() - pad_y, xy[:, 1].max() + pad_y)
+    fig.tight_layout()
+    return fig, A_thr
+
+
 def plot_circular_network(A, labels, threshold_mode, edge_percent, show_node_labels):
     A_thr, threshold_label = threshold_adjacency(A, threshold_mode, edge_percent)
     n_nodes = A_thr.shape[0]
     theta = np.linspace(0, 2 * np.pi, n_nodes, endpoint=False)
     xy = np.column_stack([np.cos(theta), np.sin(theta)])
-    max_weight = A_thr.max() if A_thr.max() > 0 else 1.0
 
     fig, ax = plt.subplots(figsize=(6.6, 6.2))
 
@@ -609,17 +969,17 @@ def plot_circular_network(A, labels, threshold_mode, edge_percent, show_node_lab
             weight = A_thr[i, j]
             if weight <= 0:
                 continue
-            scaled = weight / max_weight
+            color, alpha, linewidth = community_edge_style(i, j, labels)
             ax.plot(
                 [xy[i, 0], xy[j, 0]],
                 [xy[i, 1], xy[j, 1]],
-                color="0.2",
-                alpha=0.15 + 0.65 * scaled,
-                linewidth=0.4 + 2.4 * scaled,
+                color=color,
+                alpha=alpha,
+                linewidth=linewidth,
                 zorder=1,
             )
 
-    node_colors = plt.cm.Set2(labels / max(labels.max(), 1))
+    node_colors = community_node_colors(labels, n_nodes)
     ax.scatter(
         xy[:, 0],
         xy[:, 1],
@@ -630,18 +990,20 @@ def plot_circular_network(A, labels, threshold_mode, edge_percent, show_node_lab
         zorder=3,
     )
 
+    names = channel_labels(n_nodes)
     if show_node_labels:
         for idx, (x_pos, y_pos) in enumerate(xy):
             ax.text(
                 x_pos * 1.14,
                 y_pos * 1.14,
-                str(idx + 1),
+                names[idx],
                 ha="center",
                 va="center",
                 fontsize=7,
             )
 
     ax.set_title(f"Circular Connectivity Graph\n{threshold_label}")
+    add_network_legend(ax, labels)
     ax.set_aspect("equal")
     ax.axis("off")
     fig.tight_layout()
@@ -692,6 +1054,7 @@ def main():
 
     tensors, missing = load_available_tensors()
     results = load_fcca_results(str(RESULTS_FILE))
+    ho_fcca_results = load_fcca_results(str(HO_RLSL_FCCA_RESULTS_FILE))
     erp_traces, erp_error = load_analysis_erp_traces(tuple(tensors.keys()))
 
     if not tensors:
@@ -701,12 +1064,16 @@ def main():
     with st.sidebar:
         st.header("Controls")
         condition = st.selectbox("Condition", list(tensors.keys()), index=0)
-        use_low_rank = st.checkbox(
-            "Use Tucker low-rank tensor",
-            value=True,
-            help="Matches the cleaned tensor used by tensor_de_v2.py for FCCA.",
+        low_rank_options = ["Tucker low-rank", "Raw tensor"] if analysis.HAS_TENSORLY else ["Raw tensor"]
+        if has_saved_ho_rlsl_low_rank(str(TENSOR_FILES[condition])):
+            low_rank_options.insert(1, "Ho-RLSL saved low-rank")
+        low_rank_method = st.selectbox(
+            "Analysis tensor",
+            low_rank_options,
+            index=0,
+            help="Ho-RLSL appears only when fcca_results/ho_rlsl_results.npz contains a matching low_rank array.",
         )
-        analysis_tensor = load_analysis_tensor(str(TENSOR_FILES[condition]), use_low_rank)
+        analysis_tensor = load_analysis_tensor(str(TENSOR_FILES[condition]), low_rank_method)
         n_times = analysis_tensor.shape[-1]
         intervals, change_points, change_point_method = make_change_point_intervals_cached(analysis_tensor)
         interval_name = st.selectbox("Interval", list(intervals.keys()), index=1)
@@ -719,6 +1086,7 @@ def main():
         if HAS_DYCONNMAP:
             threshold_modes.insert(0, "dyconnmap OMST")
         threshold_mode = st.selectbox("Graph threshold", threshold_modes)
+        graph_layout = st.selectbox("Graph layout", ("Scalp electrode map", "Circular"), index=0)
         edge_percent = st.slider("Top-edge percentage", 5, 100, 20, 5)
         smooth_window = st.slider("Time-course smoothing window", 1, 31, 7, 2)
         sort_heatmap = st.checkbox("Sort heatmap by community", value=True)
@@ -726,13 +1094,14 @@ def main():
 
     selected_tensor = analysis_tensor
     selected_frames = intervals[interval_name]
+    active_fcca_results = ho_fcca_results if low_rank_method == "Ho-RLSL saved low-rank" else results
 
     tabs = st.tabs(["Time Course", "Interval Network", "Subject/Time Graph", "Data"])
 
     with tabs[0]:
         st.subheader("Average ERN/CRN Waveform with Connectivity Change Points")
         st.pyplot(
-            plot_timecourses(tensors, smooth_window, erp_traces, use_low_rank=use_low_rank),
+            plot_timecourses(tensors, smooth_window, erp_traces, low_rank_method=low_rank_method),
             clear_figure=True,
         )
         if erp_error:
@@ -753,15 +1122,19 @@ def main():
         modularity_score = None
         community_method = None
         if matrix_source != "Tensor interval mean":
-            use_saved_fcca = condition == "incorrect" and use_low_rank
+            use_saved_fcca = condition == "incorrect" and low_rank_method in {
+                "Tucker low-rank",
+                "Ho-RLSL saved low-rank",
+            }
             if use_saved_fcca:
-                matrix, labels = get_fcca_interval_matrix(results, interval_name, matrix_source)
+                matrix, labels = get_fcca_interval_matrix(active_fcca_results, interval_name, matrix_source)
 
             if matrix is None:
                 interval_result = run_fcca_interval_cached(
                     str(TENSOR_FILES[condition]),
                     tuple(int(frame) for frame in selected_frames),
-                    use_low_rank,
+                    low_rank_method,
+                    interval_name,
                 )
                 matrix = (
                     interval_result["consensus_matrix"]
@@ -778,19 +1151,25 @@ def main():
 
         if matrix is None:
             matrix = interval_mean_adjacency(selected_tensor, selected_frames)
-            labels, modularity_score, community_method = analysis.modularity_communities(matrix)
+            labels, modularity_score, community_method = analysis.modularity_communities(
+                matrix,
+                clustering_profile=analysis.clustering_profile_for_interval(interval_name),
+            )
         else:
             matrix = sanitize_adjacency(matrix)
             if labels is not None:
                 labels = labels.astype(int)
                 if modularity_score is None:
                     score_key = f"{interval_name}_consensus_modularity"
-                    modularity_score = results.get(score_key, np.asarray(np.nan))
+                    modularity_score = active_fcca_results.get(score_key, np.asarray(np.nan))
                     modularity_score = float(np.asarray(modularity_score))
                     method_key = f"{interval_name}_community_method"
-                    community_method = str(np.asarray(results.get(method_key, "saved FCCA labels")).item())
+                    community_method = str(np.asarray(active_fcca_results.get(method_key, "saved FCCA labels")).item())
             else:
-                labels, modularity_score, community_method = analysis.modularity_communities(matrix)
+                labels, modularity_score, community_method = analysis.modularity_communities(
+                    matrix,
+                    clustering_profile=analysis.clustering_profile_for_interval(interval_name),
+                )
 
         col_a, col_b = st.columns(2)
         with col_a:
@@ -804,7 +1183,8 @@ def main():
                 clear_figure=True,
             )
         with col_b:
-            network_fig, A_thr = plot_circular_network(
+            plot_network = plot_electrode_network if graph_layout == "Scalp electrode map" else plot_circular_network
+            network_fig, A_thr = plot_network(
                 matrix,
                 labels,
                 threshold_mode,
@@ -846,7 +1226,10 @@ def main():
             st.metric("Approx. time", f"{time_ms:.1f} ms")
 
         A_subject = sanitize_adjacency(selected_tensor[subject_idx, :, :, time_idx])
-        subject_labels, subject_modularity, subject_method = analysis.modularity_communities(A_subject)
+        subject_labels, subject_modularity, subject_method = analysis.modularity_communities(
+            A_subject,
+            clustering_profile=analysis.clustering_profile_for_interval(interval_name),
+        )
 
         with col_time:
             st.pyplot(
@@ -859,7 +1242,8 @@ def main():
                 clear_figure=True,
             )
 
-        graph_fig, A_subject_thr = plot_circular_network(
+        plot_network = plot_electrode_network if graph_layout == "Scalp electrode map" else plot_circular_network
+        graph_fig, A_subject_thr = plot_network(
             A_subject,
             subject_labels,
             threshold_mode,
@@ -895,11 +1279,13 @@ def main():
         if missing:
             st.warning("Missing tensor files: " + ", ".join(str(path) for path in missing))
 
-        st.write("FCCA results file:", str(RESULTS_FILE))
-        st.write("FCCA keys:", sorted(results.keys()) if results else "No FCCA result file found.")
+        st.write("Tucker FCCA results file:", str(RESULTS_FILE))
+        st.write("Ho-RLSL results file:", str(HO_RLSL_RESULTS_FILE))
+        st.write("Ho-RLSL FCCA results file:", str(HO_RLSL_FCCA_RESULTS_FILE))
+        st.write("Active FCCA keys:", sorted(active_fcca_results.keys()) if active_fcca_results else "No active FCCA result file found.")
         st.write("EEG epoch directory:", str(EPOCH_DIR))
         st.write("Raw BIDS EEG directory:", str(RAW_BIDS_DIR))
-        st.write("Analysis tensor:", "Tucker low-rank" if use_low_rank else "raw tensor")
+        st.write("Analysis tensor:", low_rank_method)
         st.write("Change-point method:", change_point_method)
         if erp_traces:
             erp_table = pd.DataFrame(

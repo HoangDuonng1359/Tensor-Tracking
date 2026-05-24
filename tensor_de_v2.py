@@ -1,11 +1,30 @@
 from pathlib import Path
+import argparse
 import warnings
 
 import matplotlib.pyplot as plt
 import numpy as np
-import tensorly as tl
 from scipy.linalg import eigh
-from tensorly.decomposition import tucker
+
+try:
+    import tensorly as tl
+    from tensorly.decomposition import tucker
+
+    HAS_TENSORLY = True
+except ImportError:
+    tl = None
+    tucker = None
+    HAS_TENSORLY = False
+
+try:
+    from Ho_RLSL import HoRLSL, HoRLSLConfig, parse_optional_int_tuple
+
+    HAS_HO_RLSL = True
+except ImportError:
+    HoRLSL = None
+    HoRLSLConfig = None
+    parse_optional_int_tuple = None
+    HAS_HO_RLSL = False
 
 try:
     import mne
@@ -36,7 +55,8 @@ except ImportError:
     HAS_DYCONNMAP = False
 
 
-tl.set_backend("numpy")
+if HAS_TENSORLY:
+    tl.set_backend("numpy")
 
 INPUT_FILE = Path("tensor_4d/tensor_incorrect_4d.npy")
 CONDITION_FILES = {
@@ -45,15 +65,22 @@ CONDITION_FILES = {
 }
 OUTPUT_DIR = Path("fcca_results")
 FIGURE_DIR = OUTPUT_DIR / "figures"
+TUCKER_FCCA_RESULTS_FILE = OUTPUT_DIR / "fcca_results.npz"
+HO_RLSL_RESULTS_FILE = OUTPUT_DIR / "ho_rlsl_results.npz"
+HO_RLSL_FCCA_RESULTS_FILE = OUTPUT_DIR / "ho_rlsl_fcca_results.npz"
 EPOCH_DIR = Path("01_initial_epochs")
 RAW_BIDS_DIR = Path("ERN_Raw_Data_BIDS-Compatible")
 
 TUCKER_RANK = (10, 10, 10, 40)
+DEFAULT_HO_RLSL_MAX_RANKS = (10, 10, 10)
 
 # Detect two change points and split the time axis into three ERN phases.
 INTERVAL_NAMES = ("pre_ern", "ern", "post_ern")
 N_CHANGE_POINTS = 2
 MIN_INTERVAL_FRAMES = 10
+ADAPTIVE_RECURSIVE_MODULARITY_TOLERANCE = 0.06
+CORE_INTERVAL_NAMES = {"ern", "crn"}
+COMPACT_INTERVAL_NAMES = {"pre_ern", "post_ern", "pre_crn", "post_crn"}
 PREFERRED_ERP_CHANNELS = ("FCz", "Cz", "FC1", "FC2")
 ERP_BASELINE_MS = (-200.0, 0.0)
 ERP_TMIN = -1.0
@@ -73,10 +100,66 @@ def tucker_low_rank_decomposition(X, rank=TUCKER_RANK):
         S: residual
         core, factors: Tucker decomposition objects
     """
+    if not HAS_TENSORLY:
+        raise RuntimeError("tensorly is not installed; Tucker low-rank decomposition is unavailable.")
     core, factors = tucker(X, rank=rank, init="svd")
     L = tl.tucker_to_tensor((core, factors))
     S = X - L
     return L, S, core, factors
+
+
+def ho_rlsl_low_rank_decomposition(
+    X,
+    train_length=10,
+    alpha=8,
+    sigma_min=0.11,
+    max_ranks=DEFAULT_HO_RLSL_MAX_RANKS,
+    sparse_solver="fista",
+    fista_max_iter=20,
+    lambda_sparse=None,
+    epsilon=None,
+    epsilon_mode="absolute",
+):
+    if not HAS_HO_RLSL:
+        raise RuntimeError("Ho_RLSL.py could not be imported.")
+
+    config = HoRLSLConfig(
+        train_length=train_length,
+        alpha=alpha,
+        sigma_min=sigma_min,
+        max_ranks=max_ranks,
+        sparse_solver=sparse_solver,
+        fista_max_iter=fista_max_iter,
+        lambda_sparse=lambda_sparse,
+        epsilon=epsilon,
+        epsilon_mode=epsilon_mode,
+        tie_symmetric_modes=(0, 1),
+    )
+    result = HoRLSL(config).fit_transform_subject_first(X)
+    return result.low_rank, result.sparse, result
+
+
+def save_ho_rlsl_result(result, output_path=HO_RLSL_RESULTS_FILE, save_tensors=False):
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    save_dict = {
+        "change_points": np.asarray(result.change_points, dtype=int),
+        "update_times": np.asarray(result.update_times, dtype=int),
+        "rank_history": np.asarray(result.rank_history, dtype=object),
+        "change_history": np.asarray(result.change_history, dtype=object),
+        "input_layout": np.asarray(result.input_layout),
+        "output_layout": np.asarray(result.output_layout),
+        "internal_layout": np.asarray(result.internal_layout),
+        "original_shape": np.asarray(result.original_shape, dtype=int),
+        "internal_shape": np.asarray(result.internal_shape, dtype=int),
+        "initial_ranks": np.asarray(result.initial_ranks, dtype=int),
+        "initial_thresholds": np.asarray(result.initial_thresholds, dtype=float),
+        "config": np.asarray(result.config, dtype=object),
+    }
+    if save_tensors:
+        save_dict["low_rank"] = result.low_rank.astype(np.float32)
+        save_dict["sparse"] = result.sparse.astype(np.float32)
+
+    np.savez_compressed(output_path, **save_dict)
 
 
 def sanitize_adjacency(A):
@@ -113,7 +196,96 @@ def fiedler_split(A):
     return labels
 
 
-def modularity_communities(A, seed=42):
+def labels_to_communities(labels):
+    labels = np.asarray(labels, dtype=int)
+    return [
+        set(np.flatnonzero(labels == label).tolist())
+        for label in sorted(np.unique(labels))
+    ]
+
+
+def partition_to_labels(partition, n_nodes):
+    labels = np.zeros(n_nodes, dtype=int)
+    ordered = sorted((sorted(group) for group in partition if group), key=lambda group: group[0])
+    for label, group in enumerate(ordered):
+        labels[np.asarray(group, dtype=int)] = label
+    return labels
+
+
+def weighted_modularity(A, labels):
+    A = sanitize_adjacency(A)
+    labels = np.asarray(labels, dtype=int)
+    total_weight = A.sum() / 2.0
+    if total_weight <= 0:
+        return np.nan
+
+    degrees = A.sum(axis=1)
+    score = 0.0
+    for label in np.unique(labels):
+        nodes = np.flatnonzero(labels == label)
+        internal_weight = A[np.ix_(nodes, nodes)].sum() / 2.0
+        degree_sum = degrees[nodes].sum()
+        score += internal_weight / total_weight - (degree_sum / (2.0 * total_weight)) ** 2
+    return float(score)
+
+
+def recursive_fiedler_communities(A, min_size=3, min_gain=1e-4):
+    A = sanitize_adjacency(A)
+    n_nodes = A.shape[0]
+    partition = [list(range(n_nodes))]
+
+    changed = True
+    while changed:
+        changed = False
+        best_gain = min_gain
+        best_index = None
+        best_split = None
+
+        for idx, nodes in enumerate(partition):
+            if len(nodes) < 2 * min_size:
+                continue
+
+            subA = A[np.ix_(nodes, nodes)]
+            sublabels = fiedler_split(subA)
+            if len(np.unique(sublabels)) < 2:
+                continue
+
+            left = [nodes[i] for i in np.flatnonzero(sublabels == 0)]
+            right = [nodes[i] for i in np.flatnonzero(sublabels == 1)]
+            if len(left) < min_size or len(right) < min_size:
+                continue
+
+            gain = weighted_modularity(subA, sublabels)
+            if np.isfinite(gain) and gain > best_gain:
+                best_gain = gain
+                best_index = idx
+                best_split = [left, right]
+
+        if best_index is not None and best_split is not None:
+            partition = partition[:best_index] + best_split + partition[best_index + 1 :]
+            changed = True
+
+    labels = partition_to_labels(partition, n_nodes)
+    return labels, weighted_modularity(A, labels), "Adaptive recursive Fiedler"
+
+
+def communities_to_labels(communities, n_nodes):
+    labels = np.zeros(n_nodes, dtype=int)
+    for community_idx, community in enumerate(communities):
+        for node in community:
+            labels[node] = community_idx
+    return labels
+
+
+def clustering_profile_for_interval(interval_name=None):
+    if interval_name in CORE_INTERVAL_NAMES:
+        return "detailed"
+    if interval_name in COMPACT_INTERVAL_NAMES:
+        return "compact"
+    return "balanced"
+
+
+def modularity_communities(A, seed=42, clustering_profile="balanced"):
     """
     Split a weighted graph by maximizing modularity.
 
@@ -128,12 +300,29 @@ def modularity_communities(A, seed=42):
     if n_nodes < 2 or np.allclose(A, 0):
         return np.zeros(n_nodes, dtype=int), np.nan, "empty graph"
 
+    if clustering_profile == "detailed":
+        recursive_tolerance = 0.08
+        recursive_min_size = 3
+    elif clustering_profile == "compact":
+        recursive_tolerance = 0.0
+        recursive_min_size = 6
+    else:
+        recursive_tolerance = ADAPTIVE_RECURSIVE_MODULARITY_TOLERANCE
+        recursive_min_size = 3
+
+    recursive_labels, recursive_score, recursive_method = recursive_fiedler_communities(
+        A,
+        min_size=recursive_min_size,
+    )
+
     if "nx" not in globals() or nx is None:
-        return fiedler_split(A), np.nan, "Fiedler fallback"
+        return recursive_labels, recursive_score, recursive_method
 
     G = nx.from_numpy_array(A)
     if G.number_of_edges() == 0:
         return np.zeros(n_nodes, dtype=int), np.nan, "empty graph"
+
+    candidates = [(recursive_labels, recursive_score, recursive_method)]
 
     try:
         communities = nx.community.louvain_communities(G, weight="weight", seed=seed)
@@ -143,17 +332,27 @@ def modularity_communities(A, seed=42):
         method = "Greedy modularity"
 
     communities = [set(community) for community in communities if len(community) > 0]
-    labels = np.zeros(n_nodes, dtype=int)
-    for community_idx, community in enumerate(communities):
-        for node in community:
-            labels[node] = community_idx
+    labels = communities_to_labels(communities, n_nodes)
 
     try:
         score = nx.community.modularity(G, communities, weight="weight")
     except Exception:
         score = np.nan
+    candidates.append((labels, float(score), method))
 
-    return labels, float(score), method
+    finite_candidates = [
+        candidate for candidate in candidates if np.isfinite(candidate[1])
+    ]
+    if not finite_candidates:
+        return recursive_labels, recursive_score, recursive_method
+
+    best_labels, best_score, best_method = max(finite_candidates, key=lambda item: item[1])
+    recursive_k = len(np.unique(recursive_labels))
+    best_k = len(np.unique(best_labels))
+    if recursive_k > best_k and recursive_score >= best_score - recursive_tolerance:
+        return recursive_labels, float(recursive_score), recursive_method
+
+    return best_labels, float(best_score), best_method
 
 
 def build_consensus_matrix(labels_all, n_nodes):
@@ -734,7 +933,7 @@ def visualize_condition_timecourses(condition_files=CONDITION_FILES):
     print(f"Saved condition time-course figure: {save_path}")
 
 
-def run_fcca_interval(X_clean, frames):
+def run_fcca_interval(X_clean, frames, interval_name=None):
     """
     Minimal FCCA:
       1. Modularity split each subject-time graph.
@@ -761,7 +960,11 @@ def run_fcca_interval(X_clean, frames):
     graphs = np.asarray(graphs)
 
     consensus_matrix = build_consensus_matrix(graph_labels, n_nodes)
-    consensus_labels, consensus_modularity, consensus_method = modularity_communities(consensus_matrix)
+    clustering_profile = clustering_profile_for_interval(interval_name)
+    consensus_labels, consensus_modularity, consensus_method = modularity_communities(
+        consensus_matrix,
+        clustering_profile=clustering_profile,
+    )
     mean_adjacency = graphs.mean(axis=0)
 
     return {
@@ -771,7 +974,9 @@ def run_fcca_interval(X_clean, frames):
         "consensus_matrix": consensus_matrix,
         "consensus_labels": consensus_labels,
         "consensus_modularity": np.asarray(consensus_modularity),
-        "community_method": np.asarray(consensus_method or community_method or "unknown"),
+        "community_method": np.asarray(
+            f"{consensus_method or community_method or 'unknown'} ({clustering_profile})"
+        ),
         "mean_adjacency": mean_adjacency,
     }
 
@@ -831,25 +1036,61 @@ def plot_matrix(ax, matrix, title, labels=None):
     return order
 
 
+COMMUNITY_PALETTE = (
+    "#1f77b4",
+    "#d62728",
+    "#2ca02c",
+    "#9467bd",
+    "#ff7f0e",
+    "#17becf",
+    "#e377c2",
+    "#8c564b",
+    "#bcbd22",
+    "#7f7f7f",
+)
+
+
+def community_node_colors(labels):
+    labels = np.asarray(labels, dtype=int)
+    communities = sorted(int(label) for label in np.unique(labels))
+    color_map = {
+        community: COMMUNITY_PALETTE[idx % len(COMMUNITY_PALETTE)]
+        for idx, community in enumerate(communities)
+    }
+    return [color_map[int(label)] for label in labels]
+
+
+def community_edge_style(i, j, labels):
+    labels = np.asarray(labels, dtype=int)
+    communities = sorted(int(label) for label in np.unique(labels))
+    color_map = {
+        community: COMMUNITY_PALETTE[idx % len(COMMUNITY_PALETTE)]
+        for idx, community in enumerate(communities)
+    }
+    if labels[i] == labels[j]:
+        return color_map[int(labels[i])], 0.58, 1.25
+    return "0.70", 0.22, 0.65
+
+
 def plot_circular_graph(ax, A, labels, title):
     A_thr, efficiency, threshold_label = dyconnmap_threshold(A)
     n_nodes = A_thr.shape[0]
     theta = np.linspace(0, 2 * np.pi, n_nodes, endpoint=False)
     xy = np.column_stack([np.cos(theta), np.sin(theta)])
-    max_weight = A_thr.max() if A_thr.max() > 0 else 1.0
 
     for i in range(n_nodes):
         for j in range(i + 1, n_nodes):
             if A_thr[i, j] > 0:
+                color, alpha, linewidth = community_edge_style(i, j, labels)
                 ax.plot(
                     [xy[i, 0], xy[j, 0]],
                     [xy[i, 1], xy[j, 1]],
-                    color="0.25",
-                    alpha=0.15 + 0.65 * (A_thr[i, j] / max_weight),
-                    linewidth=0.5 + 2.0 * (A_thr[i, j] / max_weight),
+                    color=color,
+                    alpha=alpha,
+                    linewidth=linewidth,
                 )
 
-    node_colors = np.where(labels == 0, "#1f77b4", "#d62728")
+    node_colors = community_node_colors(labels)
     ax.scatter(xy[:, 0], xy[:, 1], c=node_colors, s=80, edgecolors="white", zorder=3)
 
     for idx, (x_pos, y_pos) in enumerate(xy):
@@ -888,7 +1129,7 @@ def visualize_fcca_results(results):
         plt.close(fig)
 
 
-def save_fcca_results(results, change_points=None, change_point_method=None):
+def save_fcca_results(results, change_points=None, change_point_method=None, output_path=TUCKER_FCCA_RESULTS_FILE):
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
     save_dict = {}
@@ -901,20 +1142,69 @@ def save_fcca_results(results, change_points=None, change_point_method=None):
     if change_point_method is not None:
         save_dict["change_point_method"] = np.asarray(change_point_method)
 
-    np.savez_compressed(OUTPUT_DIR / "fcca_results.npz", **save_dict)
+    np.savez_compressed(output_path, **save_dict)
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="Run tensor low-rank denoising and interval FCCA analysis.")
+    parser.add_argument("--input", type=Path, default=INPUT_FILE)
+    parser.add_argument("--low-rank-method", choices=["tucker", "ho-rlsl"], default="tucker")
+    parser.add_argument("--skip-timecourse", action="store_true")
+    parser.add_argument("--save-ho-rlsl-tensors", action="store_true")
+    parser.add_argument("--ho-train-length", type=int, default=10)
+    parser.add_argument("--ho-alpha", type=int, default=8)
+    parser.add_argument("--ho-sigma-min", type=float, default=0.11)
+    parser.add_argument("--ho-max-ranks", default="10,10,10")
+    parser.add_argument("--ho-sparse-solver", choices=["fista", "proxy"], default="fista")
+    parser.add_argument("--ho-fista-max-iter", type=int, default=20)
+    parser.add_argument("--ho-lambda-sparse", type=float, default=None)
+    parser.add_argument("--ho-epsilon", type=float, default=None)
+    parser.add_argument("--ho-epsilon-mode", choices=["absolute", "relative"], default="absolute")
+    return parser.parse_args()
 
 
 def main():
-    visualize_condition_timecourses()
+    args = parse_args()
+    if args.low_rank_method == "tucker" and not HAS_TENSORLY:
+        raise RuntimeError("tensorly is not installed. Use --low-rank-method ho-rlsl or install tensorly.")
+    if not args.skip_timecourse:
+        visualize_condition_timecourses()
 
-    X = np.load(INPUT_FILE)
+    X = np.load(args.input)
 
-    L, S, core, factors = tucker_low_rank_decomposition(X, rank=TUCKER_RANK)
-    X_clean = L
+    ho_result = None
+    output_path = TUCKER_FCCA_RESULTS_FILE
+    if args.low_rank_method == "tucker":
+        L, S, core, factors = tucker_low_rank_decomposition(X, rank=TUCKER_RANK)
+        X_clean = L
+        low_rank_label = "Tucker"
+    else:
+        max_ranks = parse_optional_int_tuple(args.ho_max_ranks)
+        if max_ranks is None or any(rank is None for rank in max_ranks):
+            raise ValueError("--ho-max-ranks must provide three integer ranks, e.g. 10,10,10")
+        L, S, ho_result = ho_rlsl_low_rank_decomposition(
+            X,
+            train_length=args.ho_train_length,
+            alpha=args.ho_alpha,
+            sigma_min=args.ho_sigma_min,
+            max_ranks=tuple(int(rank) for rank in max_ranks),
+            sparse_solver=args.ho_sparse_solver,
+            fista_max_iter=args.ho_fista_max_iter,
+            lambda_sparse=args.ho_lambda_sparse,
+            epsilon=args.ho_epsilon,
+            epsilon_mode=args.ho_epsilon_mode,
+        )
+        save_ho_rlsl_result(ho_result, save_tensors=args.save_ho_rlsl_tensors)
+        X_clean = L
+        output_path = HO_RLSL_FCCA_RESULTS_FILE
+        low_rank_label = "Ho-RLSL"
 
     print("Original:", X.shape)
-    print("Low-rank:", L.shape)
+    print(f"Low-rank ({low_rank_label}):", L.shape)
     print("Sparse residual:", S.shape)
+    if ho_result is not None:
+        print("Ho-RLSL update change points:", ho_result.change_points)
+        print(f"Saved Ho-RLSL metadata: {HO_RLSL_RESULTS_FILE}")
     print("dyconnmap visualization helpers:", "available" if HAS_DYCONNMAP else "not installed")
     print("change-point detector:", "ruptures available" if HAS_RUPTURES else "NumPy exact SSE fallback")
 
@@ -928,7 +1218,7 @@ def main():
 
     fcca_results = {}
     for interval_name, frames in intervals.items():
-        result = run_fcca_interval(X_clean, frames)
+        result = run_fcca_interval(X_clean, frames, interval_name=interval_name)
         fcca_results[interval_name] = result
         n_communities = len(np.unique(result["consensus_labels"]))
         print(
@@ -939,10 +1229,10 @@ def main():
             f"labels={result['consensus_labels']}"
         )
 
-    save_fcca_results(fcca_results, change_points, change_point_method)
+    save_fcca_results(fcca_results, change_points, change_point_method, output_path=output_path)
     visualize_fcca_results(fcca_results)
 
-    print(f"Saved FCCA arrays: {OUTPUT_DIR /  'fcca_results.npz'}")
+    print(f"Saved FCCA arrays: {output_path}")
     print(f"Saved figures: {FIGURE_DIR}")
 
 
