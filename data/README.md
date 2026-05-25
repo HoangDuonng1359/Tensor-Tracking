@@ -1,16 +1,24 @@
-# Data Directory Structure
+# Data Directory
 
-This directory contains the raw and processed data for the TrackingTensor3D project. Due to size constraints and privacy regulations, the actual data files are not included in this repository.
+Thư mục này được sử dụng để chứa dữ liệu thô (raw) và dữ liệu đã qua tiền xử lý (processed). Do kích thước dữ liệu lớn, toàn bộ các file `.npy`, `.mat`, `.set`, `.fdt` bên trong thư mục này (ngoại trừ file `.gitkeep` và `README.md`) sẽ bị bỏ qua (ignored) bởi Git.
 
-## Directory Layout
+## Cấu trúc thư mục yêu cầu
 
-- **`raw/ERN Raw Data BIDS-Compatible/`**: Place the raw ERP CORE (Ozdemir style) EEG datasets here. Each subject should have its own folder (e.g., `sub-001/eeg/*.set`).
-- **`processed_v2/01_initial_epochs/`**: Output for initial preprocessing (Resampling, Filtering, CSD).
-- **`processed_v2/02_balanced_theta_epochs/`**: Output for theta-band filtered and 1:1 balanced epochs.
-- **`processed_v2/03_connectivity_tensors/`**: Stores the generated 4D connectivity tensors (`.npy`).
-- **`processed_v2/04_matlab_results/`**: Stores the consolidated results for MATLAB analysis (`.mat`).
+Để chạy được mã nguồn, bạn cần cấu trúc thư mục `data/` như sau:
 
-## How to use
-1. Download the ERP CORE dataset.
-2. Ensure the structure matches the `config.py` paths.
-3. Run the pipeline as described in the root `README.md`.
+```text
+data/
+├── raw/
+│   └── ERN Raw Data BIDS-Compatible/
+│       ├── sub-001/
+│       ├── sub-002/
+│       └── ...
+├── processed_v2/
+│   ├── 01_epochs/                 # Dữ liệu sau khi CSD và cắt Epochs
+│   ├── 02_sampling/               # Dữ liệu sau khi lọc Theta và cân bằng trial
+│   └── 03_connectivity_tensors/   # Output cuối cùng: Tensors 4D (.npy và .mat)
+```
+
+## Hướng dẫn
+1. Tải bộ dữ liệu **ERP CORE** (ERN BIDS-Compatible) và đặt vào `data/raw/ERN Raw Data BIDS-Compatible/`.
+2. Chạy lần lượt các script trong thư mục `preprocessing/` (như `pipeline.py`, `sampling.py`, `connectivity.py`) để tạo ra Tensor 4D lưu tại `data/processed_v2/03_connectivity_tensors/`.
