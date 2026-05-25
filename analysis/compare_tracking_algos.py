@@ -3,7 +3,6 @@ import numpy as np
 import pandas as pd
 from algorithms.hosvd import HOSVDRunner, default_config_for_condition as hosvd_cfg
 from algorithms.ho_rlsl import HORLSLRunner, default_config_for_condition as horlsl_cfg
-from algorithms.toucan import TOUCANRunner, default_config_for_toucan as toucan_cfg
 from algorithms.common import convert_subject_tensor_to_stream, calculate_nmse
 from core.timing import eeg_timing_from_array
 
@@ -20,14 +19,12 @@ def benchmark():
     # Define Runners
     configs = {
         "HOSVD (Baseline)": hosvd_cfg(),
-        "HO-RLSL (Tucker)": horlsl_cfg(),
-        "TOUCAN (t-SVD)": toucan_cfg()
+        "HO-RLSL (Tucker)": horlsl_cfg()
     }
     
     runners = {
         "HOSVD (Baseline)": HOSVDRunner(configs["HOSVD (Baseline)"]),
-        "HO-RLSL (Tucker)": HORLSLRunner(configs["HO-RLSL (Tucker)"]),
-        "TOUCAN (t-SVD)": TOUCANRunner(configs["TOUCAN (t-SVD)"])
+        "HO-RLSL (Tucker)": HORLSLRunner(configs["HO-RLSL (Tucker)"])
     }
     
     results_summary = []

@@ -2,7 +2,7 @@ import numpy as np
 import pandas as pd
 from core.config import config
 from algorithms.ho_rlsl import HORLSLRunner
-from algorithms.fcca import fcca_on_lowrank_interval
+from fcca import fcca_on_lowrank_interval
 from analysis.paper_alignment import derive_primary_ern_intervals
 from analysis.paper_alignment import label_detected_intervals
 from analysis.paper_alignment import load_condition_stream

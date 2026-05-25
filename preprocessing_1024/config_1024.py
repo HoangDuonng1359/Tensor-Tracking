@@ -4,10 +4,10 @@ from typing import List, Tuple
 
 @dataclass(frozen=True)
 class PathConfig:
-  """Directory structure configuration."""
+  """Directory structure configuration for 1024Hz experiment."""
   BASE_PATH: Path = Path(__file__).resolve().parent.parent
   DATA_RAW: Path = BASE_PATH / "data" / "raw" / "ERN Raw Data BIDS-Compatible"
-  DATA_PROCESSED: Path = BASE_PATH / "data" / "processed_v2"
+  DATA_PROCESSED: Path = BASE_PATH / "data" / "processed_1024"
   
   # Sub-directories
   EPOCHS_DIR: Path = DATA_PROCESSED / "01_initial_epochs"
@@ -15,7 +15,7 @@ class PathConfig:
   TENSOR_DIR: Path = DATA_PROCESSED / "03_connectivity_tensors"
   TRACKING_DIR: Path = DATA_PROCESSED / "04_tracking_results"
   MATLAB_DIR: Path = DATA_PROCESSED / "05_matlab_results"
-  OUTPUTS_DIR: Path = BASE_PATH / "outputs" / "eda"
+  OUTPUTS_DIR: Path = BASE_PATH / "outputs" / "eda_1024"
 
   def __post_init__(self):
     """Create directories if they do not exist."""
@@ -24,8 +24,8 @@ class PathConfig:
 
 @dataclass(frozen=True)
 class EEGConfig:
-  """EEG Signal processing parameters (Ozdemir 2017)."""
-  SFREQ: int = 128 # Hz
+  """EEG Signal processing parameters (Ozdemir 2017) at 1024Hz."""
+  SFREQ: int = 1024 # Keep 1024 Hz, no downsampling
   TMIN: float = -1.0
   TMAX: float = 1.0
   BASELINE: Tuple[float, float] = (-0.6, -0.4)
@@ -50,12 +50,12 @@ class ProcessConfig:
   ICA_COMPONENTS: int = 10
   ICA_METHOD: str = 'infomax'
   
-  # Minimum trials for inclusion (set to 1 to include all subjects with errors)
+  # Minimum trials for inclusion
   MIN_INCORRECT_TRIALS: int = 1
 
 @dataclass(frozen=True)
 class GlobalConfig:
-  """Consolidated configuration."""
+  """Consolidated configuration for 1024Hz."""
   paths: PathConfig = field(default_factory=PathConfig)
   eeg: EEGConfig = field(default_factory=EEGConfig)
   proc: ProcessConfig = field(default_factory=ProcessConfig)

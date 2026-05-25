@@ -4,7 +4,7 @@ import seaborn as sns
 import os
 from algorithms.hosvd import HOSVDRunner, default_config_for_condition as hosvd_cfg
 from algorithms.ho_rlsl import HORLSLRunner, default_config_for_condition as horlsl_cfg
-from algorithms.fcca import fcca_on_lowrank_interval
+from fcca import fcca_on_lowrank_interval
 from algorithms.common import convert_subject_tensor_to_stream
 from core.timing import eeg_timing_from_array
 

@@ -1,7 +1,7 @@
 import numpy as np
 import matplotlib.pyplot as plt
 from algorithms.ho_rlsl import HORLSLRunner
-from algorithms.fcca import recursive_repartitioning
+from fcca import recursive_repartitioning
 from analysis.paper_alignment import load_condition_stream, paper_horlsl_config
 from core.config import config
 

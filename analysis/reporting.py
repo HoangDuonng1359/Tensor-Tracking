@@ -4,13 +4,13 @@ import mne
 from pathlib import Path
 from core.config import config
 from core.timing import eeg_timing_from_bundle
-from algorithms.fcca import fcca_on_lowrank_interval
+from fcca import fcca_on_lowrank_interval
 
 def plot_premium_dynamics():
     """Consolidated plot of Energy, Mass, and Rank dynamics."""
     print("Generating Premium Dynamics Plot...")
-    bundle_inc = config.paths.TENSOR_DIR / "horls_incorrect_bundle.npz"
-    bundle_cor = config.paths.TENSOR_DIR / "horls_correct_bundle.npz"
+    bundle_inc = config.paths.TRACKING_DIR / "horls_incorrect_bundle.npz"
+    bundle_cor = config.paths.TRACKING_DIR / "horls_correct_bundle.npz"
     
     if not bundle_inc.exists():
         print("Error: incorrect bundle not found.")
@@ -55,7 +55,7 @@ def plot_premium_dynamics():
 def plot_cluster_transitions():
     """Visualization of FCCA cluster evolution across detected change-points."""
     print("Generating Cluster Transition Maps...")
-    bundle_path = config.paths.TENSOR_DIR / "horls_incorrect_bundle.npz"
+    bundle_path = config.paths.TRACKING_DIR / "horls_incorrect_bundle.npz"
     with np.load(bundle_path) as b:
         tensor = b['lowrank_stream']
         intervals = b['intervals']

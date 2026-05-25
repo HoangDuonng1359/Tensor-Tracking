@@ -2,7 +2,7 @@ import numpy as np
 import pandas as pd
 import networkx as nx
 from algorithms.ho_rlsl import HORLSLRunner, default_config_for_condition as horlsl_cfg
-from algorithms.fcca import fcca_on_lowrank_interval
+from fcca import fcca_on_lowrank_interval
 from algorithms.common import convert_subject_tensor_to_stream
 
 def calculate_modularity(W, threshold_pct=80):

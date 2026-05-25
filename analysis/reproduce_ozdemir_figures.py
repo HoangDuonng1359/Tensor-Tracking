@@ -4,8 +4,7 @@ import seaborn as sns
 import os
 from algorithms.hosvd import HOSVDRunner, default_config_for_condition as hosvd_cfg
 from algorithms.ho_rlsl import HORLSLRunner, default_config_for_condition as horlsl_cfg
-from algorithms.toucan import TOUCANRunner, default_config_for_toucan
-from algorithms.fcca import fcca_on_lowrank_interval
+from fcca import fcca_on_lowrank_interval
 from algorithms.common import convert_subject_tensor_to_stream
 from core.timing import eeg_timing_from_array
 
@@ -38,7 +37,7 @@ def run_fcca_for_phases(result, stream_lowrank, timing):
     return (W_pre, W_ern, W_post), (pre_window, ern_window, post_window)
 
 def plot_reproduction():
-    print("🎬 Reproducing Ozdemir Figures for HOSVD, HO-RLSL, and TOUCAN...")
+    print("🎬 Reproducing Ozdemir Figures for HOSVD and HO-RLSL...")
     os.makedirs("outputs", exist_ok=True)
     
     data = np.load("data/processed_v2/03_connectivity_tensors/tensor_incorrect_4d.npy").astype(np.float32)
@@ -47,11 +46,10 @@ def plot_reproduction():
     
     algos = {
         "HOSVD": HOSVDRunner(hosvd_cfg()),
-        "HO-RLSL": HORLSLRunner(horlsl_cfg()),
-        "TOUCAN": TOUCANRunner(default_config_for_toucan())
+        "HO-RLSL": HORLSLRunner(horlsl_cfg())
     }
     
-    fig, axes = plt.subplots(3, 4, figsize=(24, 18))
+    fig, axes = plt.subplots(2, 4, figsize=(24, 12))
     
     for row_idx, (name, runner) in enumerate(algos.items()):
         print(f"   Processing {name}...")

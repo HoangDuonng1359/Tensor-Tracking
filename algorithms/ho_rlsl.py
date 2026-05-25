@@ -202,7 +202,7 @@ def default_config_for_condition() -> DecompositionConfig:
 
 
 def save_condition_outputs(condition: str, result: DecompositionResult) -> None:
-  output_dir = config.paths.TENSOR_DIR
+  output_dir = config.paths.TRACKING_DIR
   artifact_prefix = output_dir / f"horls_{condition}"
   bundle_path = output_dir / f"horls_{condition}_bundle.npz"
   save_result_bundle(bundle_path, result)
