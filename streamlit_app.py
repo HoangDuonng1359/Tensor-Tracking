@@ -10,6 +10,14 @@ import streamlit as st
 import tensor_de_v2 as analysis
 
 try:
+    from HoSVD import hosvd_low_rank
+
+    HAS_HOSVD = True
+except ImportError:
+    hosvd_low_rank = None
+    HAS_HOSVD = False
+
+try:
     import mne
 
     HAS_MNE = True
@@ -41,6 +49,7 @@ TENSOR_FILES = {
 RESULTS_FILE = ROOT / analysis.OUTPUT_DIR / "fcca_results.npz"
 HO_RLSL_RESULTS_FILE = ROOT / analysis.HO_RLSL_RESULTS_FILE
 HO_RLSL_FCCA_RESULTS_FILE = ROOT / analysis.HO_RLSL_FCCA_RESULTS_FILE
+HOSVD_RESULTS_FILE = ROOT / "fcca_results" / "hosvd_change_points.npz"
 FIGURE_DIR = ROOT / analysis.FIGURE_DIR
 EPOCH_DIR = ROOT / analysis.EPOCH_DIR
 RAW_BIDS_DIR = ROOT / analysis.RAW_BIDS_DIR
@@ -78,7 +87,14 @@ def load_analysis_tensor(path_str, low_rank_method):
     if low_rank_method == "Raw tensor":
         return X
 
+    if low_rank_method == "HoSVD low-rank":
+        if not HAS_HOSVD:
+            raise RuntimeError("HoSVD.py could not be imported.")
+        return hosvd_low_rank(X, ranks=(10, 10, 10))
+
     if low_rank_method == "Ho-RLSL saved low-rank":
+        if Path(path_str).resolve() != TENSOR_FILES["incorrect"].resolve():
+            raise ValueError("Saved Ho-RLSL low_rank is available only for the incorrect/ERN tensor.")
         with np.load(HO_RLSL_RESULTS_FILE, allow_pickle=True) as npz:
             if "low_rank" not in npz.files:
                 raise ValueError(
@@ -97,6 +113,8 @@ def load_analysis_tensor(path_str, low_rank_method):
 @st.cache_data(show_spinner=False)
 def has_saved_ho_rlsl_low_rank(path_str):
     path = Path(path_str)
+    if path.resolve() != TENSOR_FILES["incorrect"].resolve():
+        return False
     if not HO_RLSL_RESULTS_FILE.exists() or not path.exists():
         return False
     try:
@@ -105,6 +123,91 @@ def has_saved_ho_rlsl_low_rank(path_str):
             return "low_rank" in npz.files and npz["low_rank"].shape == tensor_shape
     except Exception:
         return False
+
+
+@st.cache_data(show_spinner=False)
+def load_saved_ho_rlsl_change_points():
+    if not HO_RLSL_RESULTS_FILE.exists():
+        return None
+    try:
+        with np.load(HO_RLSL_RESULTS_FILE, allow_pickle=True) as npz:
+            if "change_points" not in npz.files:
+                return None
+            change_points = np.asarray(npz["change_points"], dtype=int).ravel()
+            raw_change_points = (
+                np.asarray(npz["raw_change_points"], dtype=int).ravel()
+                if "raw_change_points" in npz.files
+                else change_points
+            )
+            filtered_change_points = (
+                np.asarray(npz["filtered_change_points"], dtype=int).ravel()
+                if "filtered_change_points" in npz.files
+                else change_points
+            )
+            update_times = (
+                np.asarray(npz["update_times"], dtype=int).ravel()
+                if "update_times" in npz.files
+                else np.asarray([], dtype=int)
+            )
+            change_scores = (
+                np.asarray(npz["change_scores"], dtype=float)
+                if "change_scores" in npz.files
+                else np.zeros((0, 0), dtype=float)
+            )
+            change_score_times = (
+                np.asarray(npz["change_score_times"], dtype=int).ravel()
+                if "change_score_times" in npz.files
+                else np.asarray([], dtype=int)
+            )
+            change_point_modes = (
+                np.asarray(npz["change_point_modes"], dtype=int).ravel()
+                if "change_point_modes" in npz.files
+                else np.asarray([], dtype=int)
+            )
+            sparse_solver = (
+                str(np.asarray(npz["sparse_solver"]).item())
+                if "sparse_solver" in npz.files
+                else "unknown"
+            )
+    except Exception:
+        return None
+
+    return {
+        "change_points": change_points,
+        "raw_change_points": raw_change_points,
+        "filtered_change_points": filtered_change_points,
+        "update_times": update_times,
+        "change_scores": change_scores,
+        "change_score_times": change_score_times,
+        "change_point_modes": change_point_modes,
+        "sparse_solver": sparse_solver,
+        "method": "Ho-RLSL update rule",
+        "source": str(HO_RLSL_RESULTS_FILE),
+    }
+
+
+@st.cache_data(show_spinner=False)
+def load_saved_hosvd_change_points():
+    if not HOSVD_RESULTS_FILE.exists():
+        return None
+    try:
+        with np.load(HOSVD_RESULTS_FILE, allow_pickle=True) as npz:
+            if "change_points" not in npz.files:
+                return None
+            change_points = np.asarray(npz["change_points"], dtype=int).ravel()
+            method = (
+                str(np.asarray(npz["method"]).item())
+                if "method" in npz.files
+                else "HoSVD"
+            )
+    except Exception:
+        return None
+
+    return {
+        "change_points": change_points,
+        "method": method,
+        "source": str(HOSVD_RESULTS_FILE),
+    }
 
 
 @st.cache_data(show_spinner=False)
@@ -603,6 +706,53 @@ def make_change_point_intervals_cached(X):
     return intervals, change_points, method
 
 
+def display_change_points_for_timecourse(change_point_tensor, low_rank_method, condition):
+    intervals, detected_points, detected_method = make_change_point_intervals_cached(change_point_tensor)
+    if low_rank_method == "HoSVD low-rank" and condition == "incorrect":
+        saved = load_saved_hosvd_change_points()
+        if saved is not None:
+            n_times = change_point_tensor.shape[-1]
+            points = saved["change_points"]
+            points = points[(points >= 0) & (points < n_times)]
+            intervals = analysis.make_intervals_from_change_points(n_times, points)
+            return intervals, points.astype(int).tolist(), saved["method"]
+    if low_rank_method == "Ho-RLSL saved low-rank" and condition == "incorrect":
+        saved = load_saved_ho_rlsl_change_points()
+        if saved is not None:
+            n_times = change_point_tensor.shape[-1]
+            points = saved["filtered_change_points"]
+            points = points[(points >= 0) & (points < n_times)]
+            intervals, _, metadata = analysis.make_paper_like_ho_rlsl_intervals(n_times, points)
+            raw_points = saved["raw_change_points"]
+            raw_points = raw_points[(raw_points >= 0) & (raw_points < n_times)]
+            method = f"{metadata['method']} ({saved['sparse_solver']})"
+            return (
+                intervals,
+                {
+                    "filtered": points.astype(int).tolist(),
+                    "raw": raw_points.astype(int).tolist(),
+                    "scores": saved["change_scores"],
+                    "score_times": saved["change_score_times"],
+                    "modes": saved["change_point_modes"],
+                },
+                method,
+            )
+    return intervals, detected_points, detected_method
+
+
+def normalize_change_point_display(change_points):
+    if isinstance(change_points, dict):
+        return change_points
+    points = [int(point) for point in change_points]
+    return {
+        "filtered": points,
+        "raw": points,
+        "scores": np.zeros((0, 0), dtype=float),
+        "score_times": np.asarray([], dtype=int),
+        "modes": np.asarray([], dtype=int),
+    }
+
+
 def frames_to_ms(n_times, start_ms=-1000.0, end_ms=1000.0):
     return np.linspace(start_ms, end_ms, n_times)
 
@@ -715,14 +865,22 @@ def plot_timecourses(tensors, smooth_window, erp_traces=None, low_rank_method="T
     for idx, (condition, X) in enumerate(tensors.items()):
         n_times = X.shape[-1]
         tensor_times_ms = frames_to_ms(n_times)
-        change_point_tensor = load_analysis_tensor(str(TENSOR_FILES[condition]), low_rank_method)
-        intervals, change_points, change_point_method = make_change_point_intervals_cached(change_point_tensor)
+        condition_low_rank_method = low_rank_method
+        if low_rank_method == "Ho-RLSL saved low-rank" and condition != "incorrect":
+            condition_low_rank_method = "Raw tensor"
+        change_point_tensor = load_analysis_tensor(str(TENSOR_FILES[condition]), condition_low_rank_method)
+        intervals, change_points, change_point_method = display_change_points_for_timecourse(
+            change_point_tensor,
+            condition_low_rank_method,
+            condition,
+        )
+        cp_display = normalize_change_point_display(change_points)
         erp = erp_traces.get(condition) if erp_traces else None
 
         if erp is not None:
             times_ms = erp["times_ms"]
             trace = smooth_trace(erp["trace"], smooth_window)
-            ylabel = "amplitude (uV)" if erp["channel_type"] == "eeg" else "baseline-corrected CSD"
+            ylabel = "Amplitude (uV)" if erp["channel_type"] == "eeg" else "Baseline-corrected CSD"
             event_name = "ERN" if condition == "incorrect" else "CRN"
             title = (
                 f"({chr(97 + idx)}) Average {event_name} waveform "
@@ -744,7 +902,22 @@ def plot_timecourses(tensors, smooth_window, erp_traces=None, low_rank_method="T
         ax.set_ylabel(ylabel)
         ax.set_title(title, loc="left")
         draw_interval_labels(ax, intervals, tensor_times_ms, condition)
-        for point in change_points:
+        for point in cp_display["raw"]:
+            ax.axvline(
+                tensor_times_ms[point],
+                color="0.45",
+                linewidth=0.8,
+                alpha=0.28,
+                linestyle=":",
+            )
+        for point in cp_display["filtered"]:
+            ax.axvline(
+                tensor_times_ms[point],
+                color="#d62728",
+                linewidth=1.0,
+                alpha=0.65,
+                linestyle="--",
+            )
             ax.text(
                 tensor_times_ms[point],
                 ax.get_ylim()[1],
@@ -754,16 +927,16 @@ def plot_timecourses(tensors, smooth_window, erp_traces=None, low_rank_method="T
                 fontsize=9,
                 fontweight="bold",
             )
-        ax.text(
-            0.99,
-            0.08,
-            f"{change_point_method}: frames {change_points}",
-            transform=ax.transAxes,
-            ha="right",
-            va="bottom",
-            fontsize=8,
-            color="0.25",
-        )
+        # ax.text(
+        #     0.99,
+        #     0.08,
+        #     f"{change_point_method}: frames {cp_display['filtered']}",
+        #     transform=ax.transAxes,
+        #     ha="right",
+        #     va="bottom",
+        #     fontsize=8,
+        #     color="0.25",
+        # )
         ax.tick_params(direction="in", top=True, right=True)
         ax.spines["top"].set_visible(True)
         ax.spines["right"].set_visible(True)
@@ -1048,6 +1221,16 @@ def get_fcca_interval_matrix(results, interval_name, source):
     return matrix, labels
 
 
+def saved_fcca_matches_current_intervals(results, low_rank_method):
+    if low_rank_method != "Ho-RLSL saved low-rank":
+        return True
+    method = results.get("change_point_method")
+    if method is None:
+        return False
+    method_text = str(np.asarray(method).item())
+    return method_text.startswith("Ho-RLSL update rule paper-like intervals")
+
+
 def main():
     st.title("Brain Connectivity Explorer")
     st.caption("Interactive views for 4D connectivity tensors and interval-wise FCCA outputs.")
@@ -1065,17 +1248,29 @@ def main():
         st.header("Controls")
         condition = st.selectbox("Condition", list(tensors.keys()), index=0)
         low_rank_options = ["Tucker low-rank", "Raw tensor"] if analysis.HAS_TENSORLY else ["Raw tensor"]
+        if HAS_HOSVD:
+            insert_at = 1 if "Raw tensor" in low_rank_options else len(low_rank_options)
+            low_rank_options.insert(insert_at, "HoSVD low-rank")
         if has_saved_ho_rlsl_low_rank(str(TENSOR_FILES[condition])):
             low_rank_options.insert(1, "Ho-RLSL saved low-rank")
+        default_low_rank = "Ho-RLSL saved low-rank" if "Ho-RLSL saved low-rank" in low_rank_options else "Raw tensor"
         low_rank_method = st.selectbox(
             "Analysis tensor",
             low_rank_options,
-            index=0,
-            help="Ho-RLSL appears only when fcca_results/ho_rlsl_results.npz contains a matching low_rank array.",
+            index=low_rank_options.index(default_low_rank),
+            help=(
+                "HoSVD is computed live and cached. Ho-RLSL appears only when "
+                "fcca_results/ho_rlsl_results.npz contains a matching low_rank array."
+            ),
         )
         analysis_tensor = load_analysis_tensor(str(TENSOR_FILES[condition]), low_rank_method)
         n_times = analysis_tensor.shape[-1]
-        intervals, change_points, change_point_method = make_change_point_intervals_cached(analysis_tensor)
+        intervals, change_points, change_point_method = display_change_points_for_timecourse(
+            analysis_tensor,
+            low_rank_method,
+            condition,
+        )
+        sidebar_cp_display = normalize_change_point_display(change_points)
         interval_name = st.selectbox("Interval", list(intervals.keys()), index=1)
         matrix_source = st.radio(
             "Matrix source",
@@ -1111,7 +1306,8 @@ def main():
         else:
             st.info(
                 "The red trace uses the same ERP loading pipeline as tensor_de_v2.py "
-                "(raw BIDS first, then FIF fallback). The blue lines are tensor change points."
+                "(raw BIDS first, then FIF fallback). Blue lines are selected interval "
+                "boundaries; red dashed lines are displayed change points."
             )
 
     with tabs[1]:
@@ -1125,7 +1321,7 @@ def main():
             use_saved_fcca = condition == "incorrect" and low_rank_method in {
                 "Tucker low-rank",
                 "Ho-RLSL saved low-rank",
-            }
+            } and saved_fcca_matches_current_intervals(active_fcca_results, low_rank_method)
             if use_saved_fcca:
                 matrix, labels = get_fcca_interval_matrix(active_fcca_results, interval_name, matrix_source)
 
@@ -1282,11 +1478,45 @@ def main():
         st.write("Tucker FCCA results file:", str(RESULTS_FILE))
         st.write("Ho-RLSL results file:", str(HO_RLSL_RESULTS_FILE))
         st.write("Ho-RLSL FCCA results file:", str(HO_RLSL_FCCA_RESULTS_FILE))
+        st.write("HoSVD change-points file:", str(HOSVD_RESULTS_FILE))
         st.write("Active FCCA keys:", sorted(active_fcca_results.keys()) if active_fcca_results else "No active FCCA result file found.")
         st.write("EEG epoch directory:", str(EPOCH_DIR))
         st.write("Raw BIDS EEG directory:", str(RAW_BIDS_DIR))
         st.write("Analysis tensor:", low_rank_method)
         st.write("Change-point method:", change_point_method)
+        if low_rank_method == "Ho-RLSL saved low-rank":
+            st.write("Filtered Ho-RLSL change points:", sidebar_cp_display["filtered"])
+            st.write("Raw Ho-RLSL change points:", sidebar_cp_display["raw"])
+            score_times = np.asarray(sidebar_cp_display["score_times"], dtype=int)
+            score_values = np.asarray(sidebar_cp_display["scores"], dtype=float)
+            modes = np.asarray(sidebar_cp_display["modes"], dtype=int)
+            if score_times.size and score_values.ndim == 2 and score_values.shape[0] == score_times.size:
+                time_axis = frames_to_ms(n_times)
+                filtered_set = set(int(point) for point in sidebar_cp_display["filtered"])
+                raw_set = set(int(point) for point in sidebar_cp_display["raw"])
+                rows = []
+                for idx, frame in enumerate(score_times):
+                    if frame < 0 or frame >= n_times:
+                        continue
+                    rows.append(
+                        {
+                            "frame": int(frame),
+                            "time_ms": float(time_axis[frame]),
+                            "score": float(score_values[idx, 0]),
+                            "raw_cp": int(frame) in raw_set,
+                            "filtered_cp": int(frame) in filtered_set,
+                            "is_hit_25_75ms": 25.0 <= float(time_axis[frame]) <= 75.0,
+                        }
+                    )
+                if rows:
+                    score_table = pd.DataFrame(rows)
+                    if modes.size == len(sidebar_cp_display["filtered"]):
+                        mode_by_frame = {
+                            int(frame): int(mode)
+                            for frame, mode in zip(sidebar_cp_display["filtered"], modes)
+                        }
+                        score_table["mode"] = score_table["frame"].map(mode_by_frame)
+                    st.dataframe(score_table, use_container_width=True, hide_index=True)
         if erp_traces:
             erp_table = pd.DataFrame(
                 [

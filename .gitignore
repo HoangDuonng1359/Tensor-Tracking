@@ -5,3 +5,4 @@ __pycache__/*
 *.npz
 ERN_Raw_Data_BIDS-Compatible/
 ERN Raw Data BIDS-Compatible/
+preprocessing/

@@ -141,13 +141,16 @@ class HoRLSLConfig:
     init_method: str = "hosvd"
     threshold_mode: str = "relative"
     normalize_unfoldings: bool = True
-    sparse_solver: str = "fista"
+    sparse_solver: str = "gtcs_s_omp"
     lambda_sparse: float | None = None
     epsilon: float | None = None
     epsilon_mode: str = "absolute"
     fista_max_iter: int = 50
     fista_tol: float = 1e-4
     fista_step_size: float = 1.0
+    sparsity: int = 8
+    residual_tol: float = 1e-3
+    max_atoms: int | None = None
     sparse_threshold: float = 3.0
     sparse_threshold_mode: str = "mad"
     enforce_symmetric_connectivity: bool = True
@@ -155,7 +158,17 @@ class HoRLSLConfig:
     max_ranks: tuple[int | None, ...] | None = None
     tie_symmetric_modes: tuple[int, int] | None = (0, 1)
     use_paper_change_rule: bool = True
+    change_point_position: str = "midpoint"
+    change_point_modes: tuple[int, ...] | None = None
     subspace_change_threshold: float = 0.15
+    min_cp_distance_ms: float = 50.0
+    score_smoothing_ms: float = 25.0
+    threshold_method: str = "mad"
+    threshold_k: float = 3.0
+    mode_weights: tuple[float, ...] = (1.0, 1.0, 0.4)
+    sampling_rate: float | None = 1024.0
+    target_window_ms: tuple[float, float] | None = (25.0, 75.0)
+    target_anchor_ms: float = 50.0
     store_rank_history: bool = True
 
 
@@ -168,6 +181,14 @@ class HoRLSLResult:
     rank_history: list[tuple[int, tuple[int, ...]]]
     update_times: list[int]
     change_history: list[dict[str, int]]
+    raw_change_points: list[int]
+    filtered_change_points: list[int]
+    change_point_ms: np.ndarray
+    change_point_modes: list[int]
+    change_scores: np.ndarray
+    change_score_times: np.ndarray
+    change_point_score_components: np.ndarray
+    solver_params: dict[str, object]
     input_layout: str
     output_layout: str
     internal_layout: str
@@ -214,13 +235,17 @@ class HoRLSL:
         sparse = np.zeros_like(sequence, dtype=float)
         rank_history: list[tuple[int, tuple[int, ...]]] = []
         change_points: list[int] = []
+        raw_change_points: list[int] = []
         update_times: list[int] = []
         change_history: list[dict[str, int]] = []
+        change_score_times: list[int] = []
+        change_score_rows: list[dict[str, float]] = []
         update_buffer: list[np.ndarray] = []
+        diagnostic_buffer: list[dict[str, object]] = []
 
         for t in range(n_times):
             m_t = sequence[..., t]
-            l_hat, s_hat = self._separate(m_t)
+            l_hat, s_hat, diagnostic = self._separate_with_info(m_t)
             low_rank[..., t] = l_hat
             sparse[..., t] = s_hat
 
@@ -228,20 +253,46 @@ class HoRLSL:
                 continue
 
             update_buffer.append(l_hat)
+            diagnostic_buffer.append(diagnostic)
             if len(update_buffer) < self.config.alpha:
                 continue
 
-            changed, update_events = self._update_subspaces(update_buffer, update_time=t)
+            update_start = t - len(update_buffer) + 1
+            reported_time = self._reported_change_time(update_start, t)
+            changed, update_events, score_components = self._update_subspaces(
+                update_buffer,
+                diagnostic_buffer,
+                update_time=t,
+                update_start=update_start,
+                reported_time=reported_time,
+            )
             self._apply_tied_modes()
             update_times.append(t)
+            change_score_times.append(reported_time)
+            change_score_rows.append(score_components)
             update_buffer = []
+            diagnostic_buffer = []
             change_history.extend(update_events)
 
             ranks = tuple(base.shape[1] for base in self.bases_)
             if self.config.store_rank_history:
                 rank_history.append((t, ranks))
             if changed:
-                change_points.append(t)
+                raw_change_points.append(reported_time)
+
+        filtered_change_points, filtered_indices = self._filter_change_points(
+            raw_change_points,
+            change_score_times,
+            change_score_rows,
+        )
+        change_points = filtered_change_points
+        change_point_modes = self._change_point_modes(change_history, change_points)
+        change_point_ms = self._frames_to_ms(change_points, n_times)
+        change_scores = self._change_scores_array(change_score_rows)
+        change_point_score_components = np.asarray(
+            [change_score_rows[index] for index in filtered_indices],
+            dtype=object,
+        )
 
         return HoRLSLResult(
             low_rank=low_rank,
@@ -251,6 +302,14 @@ class HoRLSL:
             rank_history=rank_history,
             update_times=update_times,
             change_history=change_history,
+            raw_change_points=raw_change_points,
+            filtered_change_points=filtered_change_points,
+            change_point_ms=change_point_ms,
+            change_point_modes=change_point_modes,
+            change_scores=change_scores,
+            change_score_times=np.asarray(change_score_times, dtype=int),
+            change_point_score_components=change_point_score_components,
+            solver_params=self._solver_params(),
             input_layout=PAPER_TIME_LAST_LAYOUT,
             output_layout=PAPER_TIME_LAST_LAYOUT,
             internal_layout=PAPER_TIME_LAST_LAYOUT,
@@ -285,12 +344,18 @@ class HoRLSL:
             raise ValueError("train_length must be positive")
         if self.config.alpha < 1:
             raise ValueError("alpha must be positive")
+        if self.config.change_point_position not in {"start", "midpoint", "end"}:
+            raise ValueError("change_point_position must be 'start', 'midpoint', or 'end'")
+        if self.config.change_point_modes is not None:
+            for mode in self.config.change_point_modes:
+                if not (0 <= int(mode) < n_modes):
+                    raise ValueError(f"change_point_modes entries must be in [0, {n_modes - 1}]")
         if self.config.init_method not in {"hosvd"}:
             raise ValueError("init_method must be 'hosvd'")
         if self.config.threshold_mode not in {"relative", "absolute"}:
             raise ValueError("threshold_mode must be 'relative' or 'absolute'")
-        if self.config.sparse_solver not in {"fista", "proxy"}:
-            raise ValueError("sparse_solver must be 'fista' or 'proxy'")
+        if self.config.sparse_solver not in {"fista", "fista_l1", "proxy", "gtcs_s_omp"}:
+            raise ValueError("sparse_solver must be 'fista', 'fista_l1', 'proxy', or 'gtcs_s_omp'")
         if self.config.lambda_sparse is not None and self.config.lambda_sparse < 0:
             raise ValueError("lambda_sparse must be non-negative")
         if self.config.epsilon is not None and self.config.epsilon < 0:
@@ -303,14 +368,48 @@ class HoRLSL:
             raise ValueError("fista_tol must be non-negative")
         if self.config.fista_step_size <= 0:
             raise ValueError("fista_step_size must be positive")
+        if self.config.sparsity < 1:
+            raise ValueError("sparsity must be positive")
+        if self.config.max_atoms is not None and self.config.max_atoms < 1:
+            raise ValueError("max_atoms must be positive")
+        if self.config.residual_tol < 0:
+            raise ValueError("residual_tol must be non-negative")
         if self.config.sparse_threshold_mode not in {"mad", "relative", "absolute"}:
             raise ValueError("sparse_threshold_mode must be 'mad', 'relative', or 'absolute'")
+        if self.config.threshold_method not in {"mad", "percentile"}:
+            raise ValueError("threshold_method must be 'mad' or 'percentile'")
+        if self.config.threshold_k < 0:
+            raise ValueError("threshold_k must be non-negative")
+        if self.config.min_cp_distance_ms < 0:
+            raise ValueError("min_cp_distance_ms must be non-negative")
+        if self.config.score_smoothing_ms < 0:
+            raise ValueError("score_smoothing_ms must be non-negative")
+        if self.config.sampling_rate is not None and self.config.sampling_rate <= 0:
+            raise ValueError("sampling_rate must be positive when provided")
+        if self.config.target_window_ms is not None:
+            if len(self.config.target_window_ms) != 2:
+                raise ValueError("target_window_ms must contain start and end in milliseconds")
+            if self.config.target_window_ms[0] > self.config.target_window_ms[1]:
+                raise ValueError("target_window_ms start must be <= end")
+        if len(self.config.mode_weights) < n_modes:
+            raise ValueError(f"mode_weights must contain at least {n_modes} entries")
         if self.config.max_ranks is not None and len(self.config.max_ranks) != n_modes:
             raise ValueError(f"max_ranks must contain {n_modes} entries")
         if self.config.tie_symmetric_modes is not None:
             source, target = self.config.tie_symmetric_modes
             if not (0 <= source < n_modes and 0 <= target < n_modes):
                 raise ValueError(f"tie_symmetric_modes entries must be in [0, {n_modes - 1}]")
+
+    def _reported_change_time(self, update_start: int, update_end: int) -> int:
+        if self.config.change_point_position == "start":
+            return int(update_start)
+        if self.config.change_point_position == "end":
+            return int(update_end)
+        return int(round((int(update_start) + int(update_end)) / 2))
+
+    def _mode_counts_for_change_point(self, mode: int) -> bool:
+        modes = self.config.change_point_modes
+        return modes is None or int(mode) in {int(item) for item in modes}
 
     def _initial_subspaces(self, train: np.ndarray) -> tuple[list[np.ndarray], list[float]]:
         if self.config.init_method == "hosvd":
@@ -390,13 +489,29 @@ class HoRLSL:
         return value * robust_sigma
 
     def _separate(self, observed: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        low_hat, sparse_hat, _ = self._separate_with_info(observed)
+        return low_hat, sparse_hat
+
+    def _separate_with_info(self, observed: np.ndarray) -> tuple[np.ndarray, np.ndarray, dict[str, object]]:
         projectors = self._orthogonal_projectors()
         projected_measurement = self._project_orthogonal(observed, projectors)
-        sparse_hat = self._recover_sparse(projected_measurement, projectors)
+        sparse_hat, solver_info = self._recover_sparse_with_info(projected_measurement, projectors)
         low_hat = observed - sparse_hat
         low_hat = self._sanitize_low_rank(low_hat)
         sparse_hat = observed - low_hat
-        return low_hat, sparse_hat
+        support = np.flatnonzero(np.abs(sparse_hat).ravel() > np.finfo(float).eps)
+        projected_norm = float(np.linalg.norm(projected_measurement))
+        reconstruction_error = float(solver_info.get("residual_norm", 0.0)) / max(projected_norm, 1.0)
+        info = {
+            **solver_info,
+            "support": support.astype(int),
+            "support_size": int(support.size),
+            "sparse_energy": float(np.linalg.norm(sparse_hat)),
+            "low_rank_energy": float(np.linalg.norm(low_hat)),
+            "projected_norm": projected_norm,
+            "reconstruction_error": reconstruction_error,
+        }
+        return low_hat, sparse_hat, info
 
     def _orthogonal_projectors(self) -> list[np.ndarray]:
         """Return phi_i = I - P_i P_i^T for each tracked mode."""
@@ -430,10 +545,32 @@ class HoRLSL:
         )
 
     def _recover_sparse(self, projected_measurement: np.ndarray, projectors: list[np.ndarray]) -> np.ndarray:
+        sparse, _ = self._recover_sparse_with_info(projected_measurement, projectors)
+        return sparse
+
+    def _recover_sparse_with_info(
+        self,
+        projected_measurement: np.ndarray,
+        projectors: list[np.ndarray],
+    ) -> tuple[np.ndarray, dict[str, object]]:
         if self.config.sparse_solver == "proxy":
             sparse_proxy = self._backproject_sparse_proxy(projected_measurement, projectors)
-            return soft_threshold(sparse_proxy, self._sparse_threshold(sparse_proxy))
-        return self._recover_sparse_fista(projected_measurement, projectors)
+            sparse = soft_threshold(sparse_proxy, self._sparse_threshold(sparse_proxy))
+            residual = self._project_orthogonal(sparse, projectors) - projected_measurement
+            return sparse, {
+                "solver": "proxy",
+                "residual_norm": float(np.linalg.norm(residual)),
+                "selected_atoms": np.flatnonzero(np.abs(sparse).ravel() > np.finfo(float).eps).astype(int),
+            }
+        if self.config.sparse_solver == "gtcs_s_omp":
+            return self._recover_sparse_gtcs_s_omp(projected_measurement, projectors)
+        sparse = self._recover_sparse_fista(projected_measurement, projectors)
+        residual = self._project_orthogonal(sparse, projectors) - projected_measurement
+        return sparse, {
+            "solver": "fista_l1",
+            "residual_norm": float(np.linalg.norm(residual)),
+            "selected_atoms": np.flatnonzero(np.abs(sparse).ravel() > np.finfo(float).eps).astype(int),
+        }
 
     def _lambda_sparse(self, projected_measurement: np.ndarray, projectors: list[np.ndarray]) -> float:
         if self.config.lambda_sparse is not None:
@@ -489,6 +626,72 @@ class HoRLSL:
 
         return sparse
 
+    def _recover_sparse_gtcs_s_omp(
+        self,
+        projected_measurement: np.ndarray,
+        projectors: list[np.ndarray],
+    ) -> tuple[np.ndarray, dict[str, object]]:
+        """GTCS-S-inspired greedy sparse recovery.
+
+        This is not the MATLAB GTCS-S routine from the paper. It keeps the
+        same compressed tensor measurement model, then performs an OMP-style
+        sparse pursuit over canonical tensor atoms under `A(S)=S x_i phi_i`.
+        """
+        residual = np.asarray(projected_measurement, dtype=float).copy()
+        target = projected_measurement.ravel()
+        shape = projected_measurement.shape
+        max_atoms = self.config.max_atoms or self.config.sparsity
+        max_atoms = int(min(max_atoms, self.config.sparsity, projected_measurement.size))
+        selected: list[int] = []
+        residual_history = [float(np.linalg.norm(residual))]
+        coefficients = np.asarray([], dtype=float)
+
+        for _ in range(max_atoms):
+            proxy = self._backproject_sparse_proxy(residual, projectors).ravel()
+            if selected:
+                proxy[np.asarray(selected, dtype=int)] = 0.0
+            atom_index = int(np.argmax(np.abs(proxy)))
+            if abs(float(proxy[atom_index])) <= np.finfo(float).eps:
+                break
+
+            selected.append(atom_index)
+            dictionary = np.column_stack(
+                [self._projected_canonical_atom(index, shape, projectors).ravel() for index in selected]
+            )
+            coefficients, *_ = np.linalg.lstsq(dictionary, target, rcond=None)
+            residual_vector = target - dictionary @ coefficients
+            residual = residual_vector.reshape(shape)
+            residual_norm = float(np.linalg.norm(residual))
+            residual_history.append(residual_norm)
+            target_norm = max(float(np.linalg.norm(target)), 1.0)
+            if residual_norm / target_norm <= self.config.residual_tol:
+                break
+
+        sparse = np.zeros(shape, dtype=float)
+        if selected:
+            sparse.ravel()[np.asarray(selected, dtype=int)] = coefficients
+
+        return sparse, {
+            "solver": "gtcs_s_omp",
+            "residual_norm": float(np.linalg.norm(residual)),
+            "selected_atoms": np.asarray(selected, dtype=int),
+            "residual_history": np.asarray(residual_history, dtype=float),
+            "coefficients": np.asarray(coefficients, dtype=float),
+        }
+
+    def _projected_canonical_atom(
+        self,
+        flat_index: int,
+        shape: tuple[int, ...],
+        projectors: list[np.ndarray],
+    ) -> np.ndarray:
+        coords = np.unravel_index(int(flat_index), shape)
+        atom = projectors[0][:, coords[0]]
+        result = atom
+        for mode, projector in enumerate(projectors[1:], start=1):
+            result = np.multiply.outer(result, projector[:, coords[mode]])
+        return np.asarray(result, dtype=float)
+
     def _sanitize_low_rank(self, low_rank: np.ndarray) -> np.ndarray:
         low_rank = np.asarray(low_rank, dtype=float).copy()
         low_rank[~np.isfinite(low_rank)] = 0.0
@@ -513,11 +716,318 @@ class HoRLSL:
             result = mode_dot(result, basis, mode)
         return result
 
+    def _score_update(
+        self,
+        diagnostics: list[dict[str, object]],
+        tensors: list[np.ndarray],
+        previous_bases: list[np.ndarray],
+        current_bases: list[np.ndarray],
+        update_events: list[dict[str, int]],
+    ) -> dict[str, float]:
+        reconstruction_error_score = float(
+            np.mean([float(item.get("reconstruction_error", 0.0)) for item in diagnostics])
+        ) if diagnostics else 0.0
+        support_change_score = self._support_change_score(diagnostics)
+        subspace_angle_score = self._weighted_subspace_distance(previous_bases, current_bases)
+        mode_energy_score = self._mode_energy_score(tensors, current_bases)
+        direction_update_score = self._direction_update_score(update_events)
+        final_score = float(
+            0.30 * reconstruction_error_score
+            + 0.20 * support_change_score
+            + 0.30 * subspace_angle_score
+            + 0.15 * mode_energy_score
+            + 0.05 * direction_update_score
+        )
+        dominant_mode = self._dominant_changed_mode(update_events, previous_bases, current_bases)
+        return {
+            "reconstruction_error_score": reconstruction_error_score,
+            "support_change_score": support_change_score,
+            "subspace_angle_score": subspace_angle_score,
+            "mode_energy_score": mode_energy_score,
+            "direction_update_score": direction_update_score,
+            "final_score": final_score,
+            "adaptive_threshold": 0.0,
+            "dominant_mode": float(dominant_mode),
+        }
+
+    def _support_change_score(self, diagnostics: list[dict[str, object]]) -> float:
+        supports = [set(np.asarray(item.get("support", []), dtype=int).ravel().tolist()) for item in diagnostics]
+        if len(supports) < 2:
+            return 0.0
+        scores = []
+        previous = supports[0]
+        for current in supports[1:]:
+            union = previous | current
+            if not union:
+                scores.append(0.0)
+            else:
+                scores.append(1.0 - len(previous & current) / len(union))
+            previous = current
+        return float(np.mean(scores)) if scores else 0.0
+
+    def _mode_weight(self, mode: int) -> float:
+        if mode < len(self.config.mode_weights):
+            return float(self.config.mode_weights[mode])
+        return 1.0
+
+    def _weighted_subspace_distance(
+        self,
+        previous_bases: list[np.ndarray],
+        current_bases: list[np.ndarray],
+    ) -> float:
+        weighted = []
+        weights = []
+        for mode, (old_basis, new_basis) in enumerate(zip(previous_bases, current_bases)):
+            weight = self._mode_weight(mode)
+            weighted.append(weight * subspace_distance(old_basis, new_basis))
+            weights.append(weight)
+        return float(np.sum(weighted) / max(np.sum(weights), np.finfo(float).eps)) if weighted else 0.0
+
+    def _mode_energy_score(self, tensors: list[np.ndarray], bases: list[np.ndarray]) -> float:
+        if not tensors:
+            return 0.0
+        mode_scores = []
+        weights = []
+        for mode, basis in enumerate(bases):
+            residual_ratios = []
+            for tensor in tensors:
+                data = unfold(tensor, mode)
+                if basis.shape[1] > 0:
+                    residual = data - basis @ (basis.T @ data)
+                else:
+                    residual = data
+                residual_ratios.append(float(np.linalg.norm(residual) / max(np.linalg.norm(data), 1.0)))
+            weight = self._mode_weight(mode)
+            mode_scores.append(weight * float(np.mean(residual_ratios)))
+            weights.append(weight)
+        return float(np.sum(mode_scores) / max(np.sum(weights), np.finfo(float).eps)) if mode_scores else 0.0
+
+    def _direction_update_score(self, update_events: list[dict[str, int]]) -> float:
+        if not update_events:
+            return 0.0
+        score = 0.0
+        total_weight = 0.0
+        for event in update_events:
+            mode = int(event.get("mode", 0))
+            weight = self._mode_weight(mode)
+            score += weight * float(int(event.get("deleted", 0)) + int(event.get("added", 0)))
+            total_weight += weight
+        return float(score / max(total_weight, 1.0))
+
+    def _dominant_changed_mode(
+        self,
+        update_events: list[dict[str, int]],
+        previous_bases: list[np.ndarray],
+        current_bases: list[np.ndarray],
+    ) -> int:
+        candidates = []
+        for event in update_events:
+            if int(event.get("changed", 0)) == 0:
+                continue
+            mode = int(event.get("mode", -1))
+            if mode < 0 or mode >= len(current_bases):
+                continue
+            score = (
+                self._mode_weight(mode)
+                * (1.0 + int(event.get("deleted", 0)) + int(event.get("added", 0)))
+                * max(subspace_distance(previous_bases[mode], current_bases[mode]), np.finfo(float).eps)
+            )
+            candidates.append((score, mode))
+        if not candidates:
+            return -1
+        return int(max(candidates, key=lambda item: item[0])[1])
+
+    def _change_scores_array(self, rows: list[dict[str, float]]) -> np.ndarray:
+        if not rows:
+            return np.zeros((0, 7), dtype=float)
+        keys = (
+            "final_score",
+            "reconstruction_error_score",
+            "support_change_score",
+            "subspace_angle_score",
+            "mode_energy_score",
+            "direction_update_score",
+            "dominant_mode",
+        )
+        return np.asarray([[float(row.get(key, 0.0)) for key in keys] for row in rows], dtype=float)
+
+    def _filter_change_points(
+        self,
+        raw_change_points: list[int],
+        score_times: list[int],
+        score_rows: list[dict[str, float]],
+    ) -> tuple[list[int], list[int]]:
+        if not raw_change_points or not score_times or not score_rows:
+            return [], []
+
+        times = np.asarray(score_times, dtype=int)
+        scores = np.asarray([float(row.get("final_score", 0.0)) for row in score_rows], dtype=float)
+        smoothed = self._smooth_scores(scores)
+        threshold = self._adaptive_score_threshold(smoothed)
+        for row, smooth_score in zip(score_rows, smoothed):
+            row["smoothed_final_score"] = float(smooth_score)
+            row["adaptive_threshold"] = float(threshold)
+
+        raw_set = {int(point) for point in raw_change_points}
+        candidate_indices = [
+            index for index, point in enumerate(times)
+            if int(point) in raw_set and smoothed[index] >= threshold and self._is_local_peak(smoothed, index)
+        ]
+        if not candidate_indices:
+            candidate_indices = [
+                index for index, point in enumerate(times)
+                if int(point) in raw_set and smoothed[index] >= threshold
+            ]
+        if not candidate_indices and raw_set:
+            raw_indices = [index for index, point in enumerate(times) if int(point) in raw_set]
+            if raw_indices:
+                candidate_indices = [max(raw_indices, key=lambda index: smoothed[index])]
+
+        target_context = self._target_context_indices(times, raw_set, smoothed)
+        if target_context:
+            candidate_indices = target_context
+
+        min_distance = self._min_cp_distance_frames()
+        selected: list[int] = []
+        for index in sorted(candidate_indices, key=lambda item: smoothed[item], reverse=True):
+            point = int(times[index])
+            if all(abs(point - int(times[kept])) >= min_distance for kept in selected):
+                selected.append(index)
+        selected.sort(key=lambda index: int(times[index]))
+        return [int(times[index]) for index in selected], selected
+
+    def _target_context_indices(
+        self,
+        times: np.ndarray,
+        raw_set: set[int],
+        scores: np.ndarray,
+    ) -> list[int]:
+        if self.config.target_window_ms is None or not raw_set:
+            return []
+        start_ms, end_ms = self.config.target_window_ms
+        raw_indices = [index for index, point in enumerate(times) if int(point) in raw_set]
+        if not raw_indices:
+            return []
+        target_indices = [
+            index for index in raw_indices
+            if float(start_ms) <= self._frame_to_ms(int(times[index])) <= float(end_ms)
+        ]
+        if not target_indices:
+            return []
+
+        anchor = min(
+            target_indices,
+            key=lambda index: (
+                abs(self._frame_to_ms(int(times[index])) - float(self.config.target_anchor_ms)),
+                -float(scores[index]),
+            ),
+        )
+        before = [index for index in raw_indices if int(times[index]) < int(times[anchor])]
+        after = [index for index in raw_indices if int(times[index]) > int(times[anchor])]
+        context = []
+        if before:
+            context.append(max(before, key=lambda index: int(times[index])))
+        context.append(anchor)
+        if after:
+            context.append(min(after, key=lambda index: int(times[index])))
+        return sorted(set(context), key=lambda index: int(times[index]))
+
+    def _smooth_scores(self, scores: np.ndarray) -> np.ndarray:
+        scores = np.asarray(scores, dtype=float).ravel()
+        if scores.size == 0:
+            return scores
+        width = self._score_smoothing_windows()
+        if width <= 1 or scores.size < width:
+            return scores.copy()
+        if width % 2 == 0:
+            width += 1
+        kernel = np.ones(width, dtype=float) / float(width)
+        padded = np.pad(scores, width // 2, mode="edge")
+        return np.convolve(padded, kernel, mode="valid")
+
+    def _score_smoothing_windows(self) -> int:
+        if self.config.sampling_rate is None or self.config.score_smoothing_ms <= 0:
+            return 1
+        frames = (float(self.config.score_smoothing_ms) / 1000.0) * float(self.config.sampling_rate)
+        return max(1, int(round(frames / max(int(self.config.alpha), 1))))
+
+    def _adaptive_score_threshold(self, scores: np.ndarray) -> float:
+        scores = np.asarray(scores, dtype=float).ravel()
+        if scores.size == 0:
+            return np.inf
+        if self.config.threshold_method == "percentile":
+            percentile = float(np.clip(self.config.threshold_k, 0.0, 100.0))
+            return float(np.percentile(scores, percentile))
+        median = float(np.median(scores))
+        mad = float(np.median(np.abs(scores - median)))
+        robust_sigma = 1.4826 * mad
+        if robust_sigma <= np.finfo(float).eps:
+            robust_sigma = float(np.std(scores))
+        return float(median + float(self.config.threshold_k) * robust_sigma)
+
+    def _is_local_peak(self, scores: np.ndarray, index: int) -> bool:
+        left = scores[index - 1] if index > 0 else -np.inf
+        right = scores[index + 1] if index + 1 < scores.size else -np.inf
+        return bool(scores[index] >= left and scores[index] >= right)
+
+    def _min_cp_distance_frames(self) -> int:
+        if self.config.sampling_rate is None:
+            return max(1, int(self.config.alpha))
+        return max(1, int(round(float(self.config.min_cp_distance_ms) * float(self.config.sampling_rate) / 1000.0)))
+
+    def _frames_to_ms(self, points: list[int], n_times: int) -> np.ndarray:
+        if not points:
+            return np.asarray([], dtype=float)
+        if self.config.sampling_rate is not None and self.config.sampling_rate > 0:
+            center = (int(n_times) - 1) / 2.0
+            return (np.asarray(points, dtype=float) - center) * 1000.0 / float(self.config.sampling_rate)
+        return np.linspace(-1000.0, 1000.0, int(n_times))[np.asarray(points, dtype=int)]
+
+    def _frame_to_ms(self, point: int) -> float:
+        if self.config.sampling_rate is not None and self.config.sampling_rate > 0:
+            return float(-1000.0 + int(point) * 1000.0 / float(self.config.sampling_rate))
+        return float(point)
+
+    def _change_point_modes(self, change_history: list[dict[str, int]], change_points: list[int]) -> list[int]:
+        modes: list[int] = []
+        for point in change_points:
+            events = [
+                event for event in change_history
+                if int(event.get("reported_time", -1)) == int(point) and int(event.get("changed", 0))
+            ]
+            if not events:
+                modes.append(-1)
+                continue
+            best = max(
+                events,
+                key=lambda event: self._mode_weight(int(event.get("mode", 0)))
+                * (1 + int(event.get("deleted", 0)) + int(event.get("added", 0))),
+            )
+            modes.append(int(best.get("mode", -1)))
+        return modes
+
+    def _solver_params(self) -> dict[str, object]:
+        return {
+            "sparse_solver": self.config.sparse_solver,
+            "sparsity": int(self.config.sparsity),
+            "residual_tol": float(self.config.residual_tol),
+            "max_atoms": None if self.config.max_atoms is None else int(self.config.max_atoms),
+            "fista_max_iter": int(self.config.fista_max_iter),
+            "fista_tol": float(self.config.fista_tol),
+            "fista_step_size": float(self.config.fista_step_size),
+            "lambda_sparse": self.config.lambda_sparse,
+            "epsilon": self.config.epsilon,
+            "epsilon_mode": self.config.epsilon_mode,
+        }
+
     def _update_subspaces(
         self,
         tensors: list[np.ndarray],
+        diagnostics: list[dict[str, object]],
         update_time: int,
-    ) -> tuple[bool, list[dict[str, int]]]:
+        update_start: int,
+        reported_time: int,
+    ) -> tuple[bool, list[dict[str, int]], dict[str, float]]:
         if self.bases_ is None or self.thresholds_ is None:
             raise RuntimeError("Subspaces have not been initialized")
 
@@ -538,16 +1048,20 @@ class HoRLSL:
 
             self.bases_[mode] = basis
             changed = deleted_count > 0 or added_count > 0
-            changed_by_direction_update = changed_by_direction_update or changed
+            counts_for_change_point = self._mode_counts_for_change_point(mode)
+            changed_by_direction_update = changed_by_direction_update or (changed and counts_for_change_point)
             update_events.append(
                 {
                     "time": int(update_time),
+                    "window_start": int(update_start),
+                    "reported_time": int(reported_time),
                     "mode": int(mode),
                     "old_rank": int(old_rank),
                     "new_rank": int(basis.shape[1]),
                     "deleted": int(deleted_count),
                     "added": int(added_count),
                     "changed": int(changed),
+                    "counts_for_change_point": int(counts_for_change_point),
                 }
             )
 
@@ -562,17 +1076,35 @@ class HoRLSL:
                     update_events.append(
                         {
                             "time": int(update_time),
+                            "window_start": int(update_start),
+                            "reported_time": int(reported_time),
                             "mode": int(target),
                             "old_rank": int(previous_bases[target].shape[1]),
                             "new_rank": int(self.bases_[target].shape[1]),
                             "deleted": 0,
                             "added": 0,
                             "changed": 1,
+                            "counts_for_change_point": int(self._mode_counts_for_change_point(target)),
                             "tied_to": int(source),
                         }
                     )
+        score_components = self._score_update(
+            diagnostics,
+            tensors,
+            previous_bases,
+            self.bases_,
+            update_events,
+        )
+        final_score = float(score_components["final_score"])
+        threshold = float(score_components["adaptive_threshold"])
+        changed_by_score = changed_by_direction_update and final_score >= threshold
+
+        for event in update_events:
+            event["final_score_scaled"] = int(round(final_score * 1_000_000))
+            event["adaptive_threshold_scaled"] = int(round(threshold * 1_000_000))
+
         if self.config.use_paper_change_rule:
-            return changed_by_direction_update, update_events
+            return changed_by_score, update_events, score_components
 
         distance = max(
             subspace_distance(old_basis, new_basis)
@@ -581,7 +1113,7 @@ class HoRLSL:
         changed_by_distance = distance >= self.config.subspace_change_threshold
         if update_events:
             update_events[-1]["subspace_distance_scaled"] = int(round(distance * 1_000_000))
-        return changed_by_distance, update_events
+        return changed_by_distance and final_score >= threshold, update_events, score_components
 
     def _delete_directions(
         self,
@@ -701,7 +1233,7 @@ if __name__ == "__main__":
     )
     parser.add_argument("--sparse-threshold", type=float, default=3.0)
     parser.add_argument("--sparse-threshold-mode", choices=["mad", "relative", "absolute"], default="mad")
-    parser.add_argument("--sparse-solver", choices=["fista", "proxy"], default="fista")
+    parser.add_argument("--sparse-solver", choices=["fista", "fista_l1", "proxy", "gtcs_s_omp"], default="gtcs_s_omp")
     parser.add_argument("--lambda-sparse", type=float, default=None)
     parser.add_argument(
         "--epsilon",
@@ -713,6 +1245,9 @@ if __name__ == "__main__":
     parser.add_argument("--fista-max-iter", type=int, default=50)
     parser.add_argument("--fista-tol", type=float, default=1e-4)
     parser.add_argument("--fista-step-size", type=float, default=1.0)
+    parser.add_argument("--sparsity", type=int, default=8)
+    parser.add_argument("--residual-tol", type=float, default=1e-3)
+    parser.add_argument("--max-atoms", type=int, default=None)
     parser.add_argument(
         "--max-ranks",
         default=None,
@@ -738,11 +1273,50 @@ if __name__ == "__main__":
         action="store_true",
         help="Use the fallback subspace-distance change rule instead of the paper add/delete rule.",
     )
+    parser.add_argument(
+        "--change-point-position",
+        choices=["start", "midpoint", "end"],
+        default="midpoint",
+        help=(
+            "Report detected changes at the update window start, midpoint, or end. "
+            "The update time is still stored separately in update_times."
+        ),
+    )
+    parser.add_argument(
+        "--change-point-modes",
+        default=None,
+        help=(
+            "Optional comma-separated internal modes allowed to create change points. "
+            "For paper layout, modes 0 and 1 are connectivity and mode 2 is subjects."
+        ),
+    )
+    parser.add_argument("--min-cp-distance-ms", type=float, default=50.0)
+    parser.add_argument("--score-smoothing-ms", type=float, default=25.0)
+    parser.add_argument("--threshold-method", choices=["mad", "percentile"], default="mad")
+    parser.add_argument("--threshold-k", type=float, default=3.0)
+    parser.add_argument("--target-window-ms", default="25,75")
+    parser.add_argument("--target-anchor-ms", type=float, default=50.0)
+    parser.add_argument(
+        "--mode-weights",
+        default="1.0,1.0,0.4",
+        help="Comma-separated weights for internal modes 0,1,2.",
+    )
+    parser.add_argument("--sampling-rate", type=float, default=1024.0)
     args = parser.parse_args()
 
     x = np.load(args.input)
     max_ranks = parse_optional_int_tuple(args.max_ranks)
     tie_symmetric_modes = parse_int_pair(args.tie_symmetric_modes)
+    change_point_modes = parse_optional_int_tuple(args.change_point_modes)
+    if change_point_modes is not None and any(mode is None for mode in change_point_modes):
+        raise ValueError("--change-point-modes must contain integers only, e.g. '0' or '0,1'")
+    mode_weights = tuple(float(item.strip()) for item in args.mode_weights.split(",") if item.strip())
+    target_window_ms = None
+    if args.target_window_ms.strip().lower() not in {"none", "null", "-"}:
+        target_parts = [float(item.strip()) for item in args.target_window_ms.split(",")]
+        if len(target_parts) != 2:
+            raise ValueError("--target-window-ms must be 'start,end' or 'None'")
+        target_window_ms = (target_parts[0], target_parts[1])
     cfg = HoRLSLConfig(
         train_length=args.train_length,
         alpha=args.alpha,
@@ -757,6 +1331,9 @@ if __name__ == "__main__":
         fista_max_iter=args.fista_max_iter,
         fista_tol=args.fista_tol,
         fista_step_size=args.fista_step_size,
+        sparsity=args.sparsity,
+        residual_tol=args.residual_tol,
+        max_atoms=args.max_atoms,
         sparse_threshold=args.sparse_threshold,
         sparse_threshold_mode=args.sparse_threshold_mode,
         enforce_symmetric_connectivity=not args.no_symmetric_connectivity,
@@ -764,6 +1341,16 @@ if __name__ == "__main__":
         max_ranks=max_ranks,
         tie_symmetric_modes=tie_symmetric_modes,
         use_paper_change_rule=not args.subspace_distance_change_rule,
+        change_point_position=args.change_point_position,
+        change_point_modes=None if change_point_modes is None else tuple(int(mode) for mode in change_point_modes),
+        min_cp_distance_ms=args.min_cp_distance_ms,
+        score_smoothing_ms=args.score_smoothing_ms,
+        threshold_method=args.threshold_method,
+        threshold_k=args.threshold_k,
+        mode_weights=mode_weights,
+        sampling_rate=args.sampling_rate,
+        target_window_ms=target_window_ms,
+        target_anchor_ms=args.target_anchor_ms,
     )
     if args.layout == "subject-first":
         out = fit_transform_subject_first(x, cfg)
@@ -774,6 +1361,15 @@ if __name__ == "__main__":
         low_rank=out.low_rank.astype(np.float32),
         sparse=out.sparse.astype(np.float32),
         change_points=np.asarray(out.change_points, dtype=int),
+        raw_change_points=np.asarray(out.raw_change_points, dtype=int),
+        filtered_change_points=np.asarray(out.filtered_change_points, dtype=int),
+        change_point_ms=np.asarray(out.change_point_ms, dtype=float),
+        change_point_modes=np.asarray(out.change_point_modes, dtype=int),
+        change_scores=np.asarray(out.change_scores, dtype=float),
+        change_score_times=np.asarray(out.change_score_times, dtype=int),
+        change_point_score_components=np.asarray(out.change_point_score_components, dtype=object),
+        sparse_solver=np.asarray(out.config.get("sparse_solver", "")),
+        solver_params=np.asarray(out.solver_params, dtype=object),
         update_times=np.asarray(out.update_times, dtype=int),
         rank_history=np.asarray(out.rank_history, dtype=object),
         change_history=np.asarray(out.change_history, dtype=object),

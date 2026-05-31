@@ -1,5 +1,6 @@
 from pathlib import Path
 import argparse
+import json
 import warnings
 
 import matplotlib.pyplot as plt
@@ -68,8 +69,14 @@ FIGURE_DIR = OUTPUT_DIR / "figures"
 TUCKER_FCCA_RESULTS_FILE = OUTPUT_DIR / "fcca_results.npz"
 HO_RLSL_RESULTS_FILE = OUTPUT_DIR / "ho_rlsl_results.npz"
 HO_RLSL_FCCA_RESULTS_FILE = OUTPUT_DIR / "ho_rlsl_fcca_results.npz"
+HO_RLSL_PAPER_LIKE_REPORT_FILE = OUTPUT_DIR / "paper_like_ho_rlsl_report.json"
 EPOCH_DIR = Path("01_initial_epochs")
-RAW_BIDS_DIR = Path("ERN_Raw_Data_BIDS-Compatible")
+RAW_BIDS_DIR = Path("ERN Raw Data BIDS-Compatible")
+RAW_BIDS_DIR_ALIASES = (
+    RAW_BIDS_DIR,
+    Path("ERN_Raw_Data_BIDS-Compatible"),
+    Path("preprocessing/data/raw/ERN Raw Data BIDS-Compatible"),
+)
 
 TUCKER_RANK = (10, 10, 10, 40)
 DEFAULT_HO_RLSL_MAX_RANKS = (10, 10, 10)
@@ -114,11 +121,19 @@ def ho_rlsl_low_rank_decomposition(
     alpha=8,
     sigma_min=0.11,
     max_ranks=DEFAULT_HO_RLSL_MAX_RANKS,
-    sparse_solver="fista",
+    sparse_solver="gtcs_s_omp",
     fista_max_iter=20,
     lambda_sparse=None,
     epsilon=None,
     epsilon_mode="absolute",
+    change_point_position="midpoint",
+    change_point_modes=None,
+    sparsity=8,
+    residual_tol=1e-3,
+    min_cp_distance_ms=50.0,
+    score_smoothing_ms=25.0,
+    threshold_k=3.0,
+    target_window_ms=(25.0, 75.0),
 ):
     if not HAS_HO_RLSL:
         raise RuntimeError("Ho_RLSL.py could not be imported.")
@@ -130,10 +145,22 @@ def ho_rlsl_low_rank_decomposition(
         max_ranks=max_ranks,
         sparse_solver=sparse_solver,
         fista_max_iter=fista_max_iter,
+        sparsity=sparsity,
+        residual_tol=residual_tol,
         lambda_sparse=lambda_sparse,
         epsilon=epsilon,
         epsilon_mode=epsilon_mode,
         tie_symmetric_modes=(0, 1),
+        change_point_position=change_point_position,
+        change_point_modes=change_point_modes,
+        min_cp_distance_ms=min_cp_distance_ms,
+        score_smoothing_ms=score_smoothing_ms,
+        threshold_k=threshold_k,
+        threshold_method="mad",
+        mode_weights=(1.0, 1.0, 0.4),
+        sampling_rate=1024.0,
+        target_window_ms=target_window_ms,
+        target_anchor_ms=50.0,
     )
     result = HoRLSL(config).fit_transform_subject_first(X)
     return result.low_rank, result.sparse, result
@@ -143,6 +170,15 @@ def save_ho_rlsl_result(result, output_path=HO_RLSL_RESULTS_FILE, save_tensors=F
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     save_dict = {
         "change_points": np.asarray(result.change_points, dtype=int),
+        "raw_change_points": np.asarray(result.raw_change_points, dtype=int),
+        "filtered_change_points": np.asarray(result.filtered_change_points, dtype=int),
+        "change_point_ms": np.asarray(result.change_point_ms, dtype=float),
+        "change_point_modes": np.asarray(result.change_point_modes, dtype=int),
+        "change_scores": np.asarray(result.change_scores, dtype=float),
+        "change_score_times": np.asarray(result.change_score_times, dtype=int),
+        "change_point_score_components": np.asarray(result.change_point_score_components, dtype=object),
+        "sparse_solver": np.asarray(result.config.get("sparse_solver", "")),
+        "solver_params": np.asarray(result.solver_params, dtype=object),
         "update_times": np.asarray(result.update_times, dtype=int),
         "rank_history": np.asarray(result.rank_history, dtype=object),
         "change_history": np.asarray(result.change_history, dtype=object),
@@ -502,6 +538,93 @@ def frames_to_ms(n_times, start_ms=-1000.0, end_ms=1000.0):
     return np.linspace(start_ms, end_ms, n_times)
 
 
+def ho_rlsl_mode_change_counts(change_history):
+    counts = {}
+    for event in change_history or []:
+        event = dict(event)
+        if int(event.get("changed", 0)):
+            mode = int(event.get("mode", -1))
+            counts[mode] = counts.get(mode, 0) + 1
+    return counts
+
+
+def make_paper_like_ho_rlsl_intervals(
+    n_times,
+    change_points,
+    names=INTERVAL_NAMES,
+    target_window_ms=(25.0, 75.0),
+    anchor_ms=50.0,
+    start_ms=-1000.0,
+    end_ms=1000.0,
+):
+    """Build pre/ERN/post intervals from Ho-RLSL update change points.
+
+    Paper-like flow: Ho-RLSL update change points define intervals; a separate
+    segmentation detector is not used. For ERN, choose the change point closest
+    to the expected ERN latency, then use its nearest neighboring Ho-RLSL
+    change points as interval boundaries.
+    """
+    times_ms = frames_to_ms(n_times, start_ms=start_ms, end_ms=end_ms)
+    points = np.asarray(change_points, dtype=int).ravel()
+    points = np.unique(points[(points > 0) & (points < n_times)])
+
+    if points.size < 2:
+        intervals = make_intervals_from_change_points(n_times, [], names)
+        metadata = {
+            "method": "Ho-RLSL update rule intervals unavailable; fallback equal split",
+            "anchor_point": None,
+            "anchor_ms": None,
+            "boundary_points": [],
+            "boundary_ms": [],
+            "all_change_points": points.astype(int).tolist(),
+            "all_change_points_ms": [float(times_ms[p]) for p in points],
+            "target_window_ms": [float(target_window_ms[0]), float(target_window_ms[1])],
+        }
+        return intervals, [], metadata
+
+    point_times = times_ms[points]
+    in_target = (point_times >= target_window_ms[0]) & (point_times <= target_window_ms[1])
+    candidate_indices = np.flatnonzero(in_target)
+    if candidate_indices.size:
+        anchor_local = int(candidate_indices[np.argmin(np.abs(point_times[candidate_indices] - anchor_ms))])
+        anchor_source = "within target window"
+    else:
+        anchor_local = int(np.argmin(np.abs(point_times - anchor_ms)))
+        anchor_source = "closest to target center fallback"
+
+    anchor_point = int(points[anchor_local])
+    before = points[points < anchor_point]
+    after = points[points > anchor_point]
+
+    if before.size and after.size:
+        boundaries = [int(before[-1]), int(after[0])]
+    elif before.size:
+        boundaries = [int(before[-1]), min(n_times - 1, anchor_point + max(1, anchor_point - int(before[-1])))]
+    elif after.size:
+        boundaries = [max(1, anchor_point - max(1, int(after[0]) - anchor_point)), int(after[0])]
+    else:
+        boundaries = []
+
+    boundaries = sorted({point for point in boundaries if 0 < point < n_times})
+    intervals = make_intervals_from_change_points(n_times, boundaries, names)
+    method = (
+        "Ho-RLSL update rule paper-like intervals "
+        f"({anchor_source}; anchor {times_ms[anchor_point]:.1f} ms)"
+    )
+    metadata = {
+        "method": method,
+        "anchor_point": anchor_point,
+        "anchor_ms": float(times_ms[anchor_point]),
+        "anchor_source": anchor_source,
+        "boundary_points": [int(point) for point in boundaries],
+        "boundary_ms": [float(times_ms[point]) for point in boundaries],
+        "all_change_points": points.astype(int).tolist(),
+        "all_change_points_ms": [float(times_ms[point]) for point in points],
+        "target_window_ms": [float(target_window_ms[0]), float(target_window_ms[1])],
+    }
+    return intervals, boundaries, metadata
+
+
 def condition_event_names(epochs, condition):
     names = list(getattr(epochs, "event_id", {}).keys())
     if not names:
@@ -644,7 +767,17 @@ def load_raw_bids_erp_traces(raw_bids_dir=RAW_BIDS_DIR, conditions=CONDITION_FIL
     if not HAS_MNE:
         return {}
 
-    raw_paths = sorted(Path(raw_bids_dir).glob("sub-*/eeg/*_task-ERN_eeg.set"))
+    raw_dirs = [Path(raw_bids_dir)]
+    if Path(raw_bids_dir) == RAW_BIDS_DIR:
+        raw_dirs.extend(path for path in RAW_BIDS_DIR_ALIASES if path not in raw_dirs)
+
+    raw_paths = []
+    raw_source = None
+    for candidate in raw_dirs:
+        raw_paths = sorted(candidate.glob("sub-*/eeg/*_task-ERN_eeg.set"))
+        if raw_paths:
+            raw_source = candidate
+            break
     if not raw_paths:
         return {}
 
@@ -697,7 +830,7 @@ def load_raw_bids_erp_traces(raw_bids_dir=RAW_BIDS_DIR, conditions=CONDITION_FIL
                 "channel": max(set(item["channels"]), key=item["channels"].count),
                 "channel_type": max(set(item["channel_types"]), key=item["channel_types"].count),
                 "events": tuple(sorted(item["events"])),
-                "source": "raw BIDS EEGLAB",
+                "source": f"raw BIDS EEGLAB: {raw_source}",
             }
 
     return erp
@@ -886,7 +1019,7 @@ def visualize_condition_timecourses(condition_files=CONDITION_FILES):
         if erp is not None:
             trace = smooth_trace(erp["trace"], window=7)
             times_ms = erp["times_ms"]
-            y_label = "amplitude (uV)" if erp["channel_type"] == "eeg" else "baseline-corrected CSD"
+            y_label = "Amplitude (μV)" if erp["channel_type"] == "eeg" else "Baseline-corrected CSD"
             event_name = "ERN" if condition_name == "incorrect" else "CRN"
             title = (
                 f"({chr(97 + panel_idx)}) Average {event_name} waveform: "
@@ -1129,7 +1262,13 @@ def visualize_fcca_results(results):
         plt.close(fig)
 
 
-def save_fcca_results(results, change_points=None, change_point_method=None, output_path=TUCKER_FCCA_RESULTS_FILE):
+def save_fcca_results(
+    results,
+    change_points=None,
+    change_point_method=None,
+    output_path=TUCKER_FCCA_RESULTS_FILE,
+    extra_fields=None,
+):
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
     save_dict = {}
@@ -1141,8 +1280,17 @@ def save_fcca_results(results, change_points=None, change_point_method=None, out
         save_dict["change_points"] = np.asarray(change_points, dtype=int)
     if change_point_method is not None:
         save_dict["change_point_method"] = np.asarray(change_point_method)
+    if extra_fields:
+        for key, value in extra_fields.items():
+            save_dict[key] = value
 
     np.savez_compressed(output_path, **save_dict)
+
+
+def save_paper_like_report(report, output_path=HO_RLSL_PAPER_LIKE_REPORT_FILE):
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    with open(output_path, "w", encoding="utf-8") as f:
+        json.dump(report, f, indent=2)
 
 
 def parse_args():
@@ -1155,11 +1303,25 @@ def parse_args():
     parser.add_argument("--ho-alpha", type=int, default=8)
     parser.add_argument("--ho-sigma-min", type=float, default=0.11)
     parser.add_argument("--ho-max-ranks", default="10,10,10")
-    parser.add_argument("--ho-sparse-solver", choices=["fista", "proxy"], default="fista")
+    parser.add_argument("--ho-sparse-solver", choices=["fista", "fista_l1", "proxy", "gtcs_s_omp"], default="gtcs_s_omp")
     parser.add_argument("--ho-fista-max-iter", type=int, default=20)
+    parser.add_argument("--ho-sparsity", type=int, default=8)
+    parser.add_argument("--ho-residual-tol", type=float, default=1e-3)
+    parser.add_argument("--ho-min-cp-distance-ms", type=float, default=50.0)
+    parser.add_argument("--ho-score-smoothing-ms", type=float, default=25.0)
+    parser.add_argument("--ho-threshold-k", type=float, default=3.0)
     parser.add_argument("--ho-lambda-sparse", type=float, default=None)
     parser.add_argument("--ho-epsilon", type=float, default=None)
     parser.add_argument("--ho-epsilon-mode", choices=["absolute", "relative"], default="absolute")
+    parser.add_argument("--ho-change-point-position", choices=["start", "midpoint", "end"], default="midpoint")
+    parser.add_argument(
+        "--ho-change-point-modes",
+        default=None,
+        help=(
+            "Optional comma-separated Ho-RLSL internal modes allowed to create change points. "
+            "Modes 0/1 are connectivity; mode 2 is subjects."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -1182,6 +1344,9 @@ def main():
         max_ranks = parse_optional_int_tuple(args.ho_max_ranks)
         if max_ranks is None or any(rank is None for rank in max_ranks):
             raise ValueError("--ho-max-ranks must provide three integer ranks, e.g. 10,10,10")
+        change_point_modes = parse_optional_int_tuple(args.ho_change_point_modes)
+        if change_point_modes is not None and any(mode is None for mode in change_point_modes):
+            raise ValueError("--ho-change-point-modes must contain integers only, e.g. 0 or 0,1")
         L, S, ho_result = ho_rlsl_low_rank_decomposition(
             X,
             train_length=args.ho_train_length,
@@ -1190,9 +1355,18 @@ def main():
             max_ranks=tuple(int(rank) for rank in max_ranks),
             sparse_solver=args.ho_sparse_solver,
             fista_max_iter=args.ho_fista_max_iter,
+            sparsity=args.ho_sparsity,
+            residual_tol=args.ho_residual_tol,
             lambda_sparse=args.ho_lambda_sparse,
             epsilon=args.ho_epsilon,
             epsilon_mode=args.ho_epsilon_mode,
+            change_point_position=args.ho_change_point_position,
+            change_point_modes=None
+            if change_point_modes is None
+            else tuple(int(mode) for mode in change_point_modes),
+            min_cp_distance_ms=args.ho_min_cp_distance_ms,
+            score_smoothing_ms=args.ho_score_smoothing_ms,
+            threshold_k=args.ho_threshold_k,
         )
         save_ho_rlsl_result(ho_result, save_tensors=args.save_ho_rlsl_tensors)
         X_clean = L
@@ -1203,14 +1377,23 @@ def main():
     print(f"Low-rank ({low_rank_label}):", L.shape)
     print("Sparse residual:", S.shape)
     if ho_result is not None:
-        print("Ho-RLSL update change points:", ho_result.change_points)
+        print("Ho-RLSL filtered change points:", ho_result.change_points)
+        print("Ho-RLSL raw update change points:", ho_result.raw_change_points)
         print(f"Saved Ho-RLSL metadata: {HO_RLSL_RESULTS_FILE}")
     print("dyconnmap visualization helpers:", "available" if HAS_DYCONNMAP else "not installed")
     print("change-point detector:", "ruptures available" if HAS_RUPTURES else "NumPy exact SSE fallback")
 
     n_subjects, n_nodes, _, n_times = X_clean.shape
     times_ms = frames_to_ms(n_times)
-    intervals, change_points, change_point_method = make_change_point_intervals(X_clean)
+    paper_like_metadata = None
+    if ho_result is not None:
+        intervals, change_points, paper_like_metadata = make_paper_like_ho_rlsl_intervals(
+            n_times,
+            ho_result.change_points,
+        )
+        change_point_method = paper_like_metadata["method"]
+    else:
+        intervals, change_points, change_point_method = make_change_point_intervals(X_clean)
     print(
         f"Detected change points with {change_point_method}: "
         f"frames={change_points} | ms={[round(float(times_ms[p]), 1) for p in change_points]}"
@@ -1229,8 +1412,74 @@ def main():
             f"labels={result['consensus_labels']}"
         )
 
-    save_fcca_results(fcca_results, change_points, change_point_method, output_path=output_path)
+    extra_fields = None
+    if ho_result is not None and paper_like_metadata is not None:
+        extra_fields = {
+            "ho_rlsl_update_change_points": np.asarray(ho_result.change_points, dtype=int),
+            "ho_rlsl_raw_change_points": np.asarray(ho_result.raw_change_points, dtype=int),
+            "ho_rlsl_filtered_change_points": np.asarray(ho_result.filtered_change_points, dtype=int),
+            "ho_rlsl_change_scores": np.asarray(ho_result.change_scores, dtype=float),
+            "ho_rlsl_change_score_times": np.asarray(ho_result.change_score_times, dtype=int),
+            "ho_rlsl_change_point_modes": np.asarray(ho_result.change_point_modes, dtype=int),
+            "ho_rlsl_update_change_points_ms": np.asarray(
+                [times_ms[p] for p in ho_result.change_points if 0 <= p < n_times],
+                dtype=float,
+            ),
+            "paper_like_anchor_point": np.asarray(
+                -1 if paper_like_metadata["anchor_point"] is None else paper_like_metadata["anchor_point"],
+                dtype=int,
+            ),
+            "paper_like_anchor_ms": np.asarray(
+                np.nan if paper_like_metadata["anchor_ms"] is None else paper_like_metadata["anchor_ms"],
+                dtype=float,
+            ),
+        }
+    save_fcca_results(
+        fcca_results,
+        change_points,
+        change_point_method,
+        output_path=output_path,
+        extra_fields=extra_fields,
+    )
     visualize_fcca_results(fcca_results)
+
+    if ho_result is not None and paper_like_metadata is not None:
+        report = {
+            "input": str(args.input),
+            "tensor_shape": [int(value) for value in X_clean.shape],
+            "low_rank_method": low_rank_label,
+            "ho_rlsl_config": ho_result.config,
+            "ho_rlsl_change_points": [int(point) for point in ho_result.change_points],
+            "ho_rlsl_raw_change_points": [int(point) for point in ho_result.raw_change_points],
+            "ho_rlsl_change_points_ms": [
+                float(times_ms[point]) for point in ho_result.change_points if 0 <= point < n_times
+            ],
+            "ho_rlsl_change_point_modes": [int(mode) for mode in ho_result.change_point_modes],
+            "ho_rlsl_solver_params": ho_result.solver_params,
+            "ho_rlsl_change_score_components": [
+                dict(item) for item in ho_result.change_point_score_components.tolist()
+            ],
+            "ho_rlsl_mode_change_counts": {
+                str(mode): int(count)
+                for mode, count in ho_rlsl_mode_change_counts(ho_result.change_history).items()
+            },
+            "paper_like_intervals": {
+                name: {
+                    "start_frame": int(frames[0]),
+                    "end_frame": int(frames[-1]),
+                    "start_ms": float(times_ms[frames[0]]),
+                    "end_ms": float(times_ms[frames[-1]]),
+                    "n_frames": int(len(frames)),
+                    "communities": int(len(np.unique(fcca_results[name]["consensus_labels"]))),
+                    "modularity": float(fcca_results[name]["consensus_modularity"]),
+                }
+                for name, frames in intervals.items()
+                if name in fcca_results
+            },
+            "paper_like_interval_selection": paper_like_metadata,
+        }
+        save_paper_like_report(report)
+        print(f"Saved paper-like Ho-RLSL report: {HO_RLSL_PAPER_LIKE_REPORT_FILE}")
 
     print(f"Saved FCCA arrays: {output_path}")
     print(f"Saved figures: {FIGURE_DIR}")

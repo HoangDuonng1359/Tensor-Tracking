@@ -1,257 +1,121 @@
 # Ho-RLSL
 
-## Ý tưởng chính
+## Muc tieu
 
-Tại mỗi thời điểm, dữ liệu connectivity được xem là một tensor 3D:
-
-```text
-nodes x nodes x subjects
-```
-
-Trong repo này tensor gốc đang lưu theo dạng:
+`Ho_RLSL.py` chay Higher-Order Recursive Low-Rank + Sparse Learning tren tensor connectivity:
 
 ```text
 subjects x nodes x nodes x time
 ```
 
-`Ho_RLSL.py` tự chuyển về layout paper-like:
+No tu chuyen ve layout paper-like:
 
 ```text
 nodes x nodes x subjects x time
 ```
 
-Thuật toán giả định:
+Moi frame thoi gian duoc tach thanh:
 
 ```text
 M_t = L_t + S_t
 ```
 
-Trong đó:
+- `L_t`: thanh phan low-rank, dung cho FCCA va community detection.
+- `S_t`: thanh phan sparse/outlier.
 
-- `M_t`: tensor quan sát tại thời điểm `t`.
-- `L_t`: phần low-rank, biểu diễn cấu trúc mạng não ổn định/chậm thay đổi.
-- `S_t`: phần sparse, biểu diễn nhiễu/outlier/các cạnh bất thường.
+## Solver sparse
 
-## Pipeline
-
-1. Khởi tạo subspace bằng HOSVD trên các time window đầu.
-2. Tạo projector trực giao:
+Ban hien tai co 3 solver:
 
 ```text
-phi_i = I - P_i P_i^T
+gtcs_s_omp  default, GTCS-S-inspired greedy sparse tensor pursuit
+fista_l1    L1/FISTA baseline
+proxy       thresholding nhanh, chi dung de thu nghiem
 ```
 
-3. Project tensor:
+`gtcs_s_omp` khong phai GTCS-S MATLAB chinh thuc cua bai bao, nhung gan hon FISTA vi no giai sparse pursuit tren compressed tensor measurement:
 
 ```text
 Y_t = M_t x_1 phi_1 x_2 phi_2 x_3 phi_3
 ```
 
-4. Recover sparse bằng FISTA:
+Moi vong lap chon canonical tensor atom co correlation lon nhat voi residual, fit lai coefficients bang least squares, roi dung khi dat `sparsity` hoac `residual_tol`.
+
+## Change points
+
+File `.npz` luu hai loai change point:
 
 ```text
-min_S 0.5 * ||A(S) - Y_t||_F^2 + lambda * ||S||_1
+raw_change_points       tat ca update windows co add/delete subspace direction
+filtered_change_points  raw points sau khi score, smooth, threshold va min-distance
+change_points           alias cua filtered_change_points
 ```
 
-5. Tính:
+`change_points` la danh sach nen dung cho evaluate, Streamlit va interval paper-like.
+
+Score gom:
 
 ```text
-L_hat_t = M_t - S_hat_t
+reconstruction_error_score
+support_change_score
+subspace_angle_score
+mode_energy_score
+direction_update_score
+final_score
 ```
 
-6. Cập nhật subspace theo cửa sổ `alpha`.
-7. Ghi change point nếu có add/delete direction trong subspace.
-8. Dùng low-rank tensor để chạy FCCA và vẽ các cụm pre-ERN, ERN, post-ERN.
+Detector loc nhieu bang:
 
-## Cách chạy
+```text
+MAD adaptive threshold
+score smoothing
+minimum change-point distance, mac dinh 50 ms
+mode_weights = 1.0,1.0,0.4
+```
 
-Kích hoạt môi trường:
+Mode 0/1 la connectivity; mode 2 la subjects. Subject-mode-only thay doi bi giam trong so de bot nhieu.
+
+## Lenh chay khuyen nghi
 
 ```powershell
 conda activate tensor
+python tensor_de_v2.py --low-rank-method ho-rlsl --skip-timecourse --save-ho-rlsl-tensors --ho-train-length 80 --ho-alpha 64 --ho-sparse-solver gtcs_s_omp --ho-sparsity 8 --ho-min-cp-distance-ms 50 --ho-score-smoothing-ms 25 --ho-threshold-k 3.0
 ```
 
-Chạy Ho-RLSL trong pipeline chính:
+Danh gia:
 
 ```powershell
-python tensor_de_v2.py --low-rank-method ho-rlsl --skip-timecourse
+python evaluate_change_points.py --source fcca_results/ho_rlsl_results.npz --source fcca_results/hosvd_change_points.npz
 ```
 
-Nếu muốn Streamlit đọc lại low-rank tensor Ho-RLSL:
-
-```powershell
-python tensor_de_v2.py --low-rank-method ho-rlsl --skip-timecourse --save-ho-rlsl-tensors
-```
-
-Kết quả được lưu vào:
-
-```text
-fcca_results/ho_rlsl_results.npz
-fcca_results/ho_rlsl_fcca_results.npz
-fcca_results/figures/
-```
-
-Mở giao diện:
+Mo Streamlit:
 
 ```powershell
 streamlit run streamlit_app.py
 ```
 
-Trong Streamlit, chọn:
+Trong Streamlit chon:
 
 ```text
 Analysis tensor -> Ho-RLSL saved low-rank
-Graph layout -> Scalp electrode map
 ```
 
-## Tham số quan trọng
-
-### `--ho-train-length`
-
-Số time window đầu dùng để khởi tạo subspace.
-
-```powershell
---ho-train-length 10
-```
-
-### `--ho-alpha`
-
-Số frame trong một cửa sổ cập nhật subspace.
-
-```powershell
---ho-alpha 8
-```
-
-Nhỏ quá dễ bắt nhiễu thành change point giả. Lớn quá dễ bỏ lỡ thay đổi nhanh.
-
-### `--ho-sigma-min`
-
-Ngưỡng giữ/thêm/xóa basis direction.
-
-```powershell
---ho-sigma-min 0.11
-```
-
-Tham số này rất nhạy. Nếu quá thấp, subspace giữ cả nhiễu. Nếu quá cao, thuật toán bỏ mất thay đổi thật.
-
-### `--ho-max-ranks`
-
-Giới hạn rank cho 3 mode:
-
-```powershell
---ho-max-ranks 10,10,10
-```
-
-Với tensor hiện tại `30 nodes x 30 nodes x 40 subjects`, giá trị thực dụng thường là:
+## Output chinh
 
 ```text
-8,8,8
-10,10,10
-12,12,10
+fcca_results/ho_rlsl_results.npz
+fcca_results/ho_rlsl_fcca_results.npz
+fcca_results/paper_like_ho_rlsl_report.json
 ```
 
-### `--ho-sparse-solver`
+`paper_like_ho_rlsl_report.json` luu config, solver params, change points, mode contribution va interval pre-ERN/ERN/post-ERN.
 
-Chọn solver sparse:
+## Cach doc ket qua
 
-```powershell
---ho-sparse-solver fista
-```
+Ket qua tot hon khi:
 
-Hoặc chạy nhanh hơn nhưng thô hơn:
+- Co it nhat mot `change_points` trong 25-75 ms sau response.
+- So false positives ngoai 25-75 ms giam so voi raw points.
+- Change point ERN khong chi bi chi phoi boi subject mode.
+- FCCA interval ERN co community structure ro hon pre/post.
 
-```powershell
---ho-sparse-solver proxy
-```
-
-### `--ho-fista-max-iter`
-
-Số vòng lặp FISTA:
-
-```powershell
---ho-fista-max-iter 20
-```
-
-Giảm xuống nếu chạy chậm:
-
-```powershell
---ho-fista-max-iter 5
-```
-
-## Clustering pre-ERN, ERN, post-ERN
-
-Project hiện dùng clustering theo profile interval:
-
-```text
-pre_ern  -> compact: ít cụm hơn
-ern      -> detailed: nhiều cụm hơn
-post_ern -> compact: ít cụm hơn
-```
-
-Số cụm không bị ép cố định. Thuật toán tự chọn dựa trên Louvain/Greedy và adaptive recursive Fiedler.
-
-Với kết quả hiện tại, mục tiêu là:
-
-```text
-pre_ern:  ít cụm
-ern:      nhiều cụm hơn
-post_ern: ít cụm
-```
-
-Node trong graph được tô theo community. Cạnh nối hai node cùng community dùng màu của community đó; cạnh nối khác community là xám nhạt.
-
-## Đánh giá Ho-RLSL tốt hay không
-
-Chạy synthetic benchmark:
-
-```powershell
-python test_ho_rlsl_synthetic.py
-```
-
-Các chỉ số cần xem:
-
-- `Ho-RLSL MSE intervals`
-- `HoSVD MSE intervals`
-- `cp_true`
-- `cp_detected`
-- `cp_error`
-
-Ho-RLSL tốt nếu:
-
-```text
-Ho-RLSL MSE < HoSVD MSE
-cp_error nhỏ
-change points ổn định
-ERN có modularity hoặc segregation rõ hơn pre/post
-```
-
-## Khác biệt với bài báo gốc
-
-Module hiện tại là bản **paper-like**, chưa phải bản gốc 100%.
-
-Khác biệt chính:
-
-- Bài báo dùng GTCS-S cho sparse recovery; code hiện dùng FISTA approximation.
-- Dữ liệu project hiện tại có `40 subjects x 30 nodes x 2049 time windows`, khác bài báo gốc `91 subjects x 63 channels x 256 time points`.
-- Clustering trong project đã được điều chỉnh để phục vụ visualization pre-ERN/ERN/post-ERN.
-- Tham số cần tune theo dữ liệu thật.
-
-## Lệnh gợi ý
-
-Chạy nhanh:
-
-```powershell
-python tensor_de_v2.py --low-rank-method ho-rlsl --skip-timecourse --ho-sparse-solver proxy --ho-max-ranks 8,8,8
-```
-
-Chạy FISTA nhẹ:
-
-```powershell
-python tensor_de_v2.py --low-rank-method ho-rlsl --skip-timecourse --ho-fista-max-iter 5 --ho-max-ranks 8,8,8
-```
-
-Chạy đầy đủ hơn:
-
-```powershell
-python tensor_de_v2.py --low-rank-method ho-rlsl --skip-timecourse --save-ho-rlsl-tensors --ho-fista-max-iter 20 --ho-max-ranks 10,10,10
-```
