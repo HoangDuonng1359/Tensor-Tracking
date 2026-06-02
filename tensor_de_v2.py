@@ -538,6 +538,103 @@ def frames_to_ms(n_times, start_ms=-1000.0, end_ms=1000.0):
     return np.linspace(start_ms, end_ms, n_times)
 
 
+def connectivity_change_scores(tensor, candidate_points, window=64):
+    """Score connectivity changes in a low-rank tensor around candidate frames.
+
+    The paper defines ERN intervals from change points of the connectivity
+    mode, not from subject-mode updates. This score compares the mean
+    low-rank adjacency vector before and after each candidate update point.
+    """
+    tensor = np.asarray(tensor)
+    if tensor.ndim != 4:
+        raise ValueError(f"Expected tensor shape (subjects, nodes, nodes, time), got {tensor.shape}")
+
+    n_subjects, n_nodes, n_nodes_2, n_times = tensor.shape
+    if n_nodes != n_nodes_2:
+        raise ValueError(f"Expected square node-node connectivity matrices, got {tensor.shape}")
+
+    upper = np.triu_indices(n_nodes, k=1)
+    points = np.asarray(candidate_points, dtype=int).ravel()
+    valid_points = []
+    scores = []
+    half_window = max(1, int(window))
+
+    for point in points:
+        point = int(point)
+        left_start = max(0, point - half_window)
+        left_end = point
+        right_start = point
+        right_end = min(n_times, point + half_window)
+        if left_end <= left_start or right_end <= right_start:
+            continue
+
+        left = tensor[:, upper[0], upper[1], left_start:left_end].mean(axis=(0, 2))
+        right = tensor[:, upper[0], upper[1], right_start:right_end].mean(axis=(0, 2))
+        scale = max(float(np.linalg.norm(left)), float(np.linalg.norm(right)), 1.0)
+        valid_points.append(point)
+        scores.append(float(np.linalg.norm(right - left) / scale))
+
+    return np.asarray(valid_points, dtype=int), np.asarray(scores, dtype=float)
+
+
+def select_connectivity_change_points(
+    tensor,
+    candidate_points,
+    target_window_ms=(25.0, 75.0),
+    anchor_ms=50.0,
+    score_window=64,
+    start_ms=-1000.0,
+    end_ms=1000.0,
+):
+    n_times = tensor.shape[-1]
+    times_ms = frames_to_ms(n_times, start_ms=start_ms, end_ms=end_ms)
+    points, scores = connectivity_change_scores(tensor, candidate_points, window=score_window)
+    if points.size == 0:
+        return points, {
+            "connectivity_candidate_points": [],
+            "connectivity_candidate_ms": [],
+            "connectivity_scores": [],
+            "connectivity_selection": "unavailable",
+        }
+
+    in_target = (times_ms[points] >= target_window_ms[0]) & (times_ms[points] <= target_window_ms[1])
+    if np.any(in_target):
+        target_indices = np.flatnonzero(in_target)
+        anchor_idx = int(target_indices[np.argmax(scores[target_indices])])
+        selection = "highest connectivity score in target window"
+    else:
+        anchor_idx = int(np.argmin(np.abs(times_ms[points] - anchor_ms)))
+        selection = "closest connectivity candidate to target center fallback"
+
+    anchor_point = int(points[anchor_idx])
+    before_anchor = np.flatnonzero(points < anchor_point)
+    after_anchor = np.flatnonzero(points > anchor_point)
+    selected_indices = []
+    if before_anchor.size >= 2:
+        selected_indices.append(int(before_anchor[-2]))
+    if before_anchor.size >= 1:
+        selected_indices.append(int(before_anchor[-1]))
+    selected_indices.append(anchor_idx)
+    if after_anchor.size >= 1:
+        selected_indices.append(int(after_anchor[0]))
+    if after_anchor.size >= 2:
+        selected_indices.append(int(after_anchor[1]))
+
+    selected_indices = sorted(set(selected_indices), key=lambda idx: int(points[idx]))
+    selected_points = points[selected_indices]
+    metadata = {
+        "connectivity_candidate_points": [int(point) for point in points],
+        "connectivity_candidate_ms": [float(times_ms[point]) for point in points],
+        "connectivity_scores": [float(score) for score in scores],
+        "connectivity_selected_points": [int(point) for point in selected_points],
+        "connectivity_selected_ms": [float(times_ms[point]) for point in selected_points],
+        "connectivity_anchor_point": anchor_point,
+        "connectivity_anchor_ms": float(times_ms[anchor_point]),
+        "connectivity_selection": selection,
+    }
+    return selected_points, metadata
+
+
 def ho_rlsl_mode_change_counts(change_history):
     counts = {}
     for event in change_history or []:
@@ -551,6 +648,8 @@ def ho_rlsl_mode_change_counts(change_history):
 def make_paper_like_ho_rlsl_intervals(
     n_times,
     change_points,
+    connectivity_tensor=None,
+    connectivity_candidate_points=None,
     names=INTERVAL_NAMES,
     target_window_ms=(25.0, 75.0),
     anchor_ms=50.0,
@@ -565,10 +664,22 @@ def make_paper_like_ho_rlsl_intervals(
     change points as interval boundaries.
     """
     times_ms = frames_to_ms(n_times, start_ms=start_ms, end_ms=end_ms)
-    points = np.asarray(change_points, dtype=int).ravel()
+    connectivity_metadata = {}
+    if connectivity_tensor is not None and connectivity_candidate_points is not None:
+        points, connectivity_metadata = select_connectivity_change_points(
+            connectivity_tensor,
+            connectivity_candidate_points,
+            target_window_ms=target_window_ms,
+            anchor_ms=anchor_ms,
+            score_window=64,
+            start_ms=start_ms,
+            end_ms=end_ms,
+        )
+    else:
+        points = np.asarray(change_points, dtype=int).ravel()
     points = np.unique(points[(points > 0) & (points < n_times)])
 
-    if points.size < 2:
+    if points.size < 3:
         intervals = make_intervals_from_change_points(n_times, [], names)
         metadata = {
             "method": "Ho-RLSL update rule intervals unavailable; fallback equal split",
@@ -579,6 +690,7 @@ def make_paper_like_ho_rlsl_intervals(
             "all_change_points": points.astype(int).tolist(),
             "all_change_points_ms": [float(times_ms[p]) for p in points],
             "target_window_ms": [float(target_window_ms[0]), float(target_window_ms[1])],
+            **connectivity_metadata,
         }
         return intervals, [], metadata
 
@@ -597,18 +709,53 @@ def make_paper_like_ho_rlsl_intervals(
     after = points[points > anchor_point]
 
     if before.size and after.size:
-        boundaries = [int(before[-1]), int(after[0])]
+        ern_start = int(before[-1])
+        ern_end = int(after[0])
     elif before.size:
-        boundaries = [int(before[-1]), min(n_times - 1, anchor_point + max(1, anchor_point - int(before[-1])))]
+        ern_start = int(before[-1])
+        ern_end = min(n_times - 1, anchor_point + max(1, anchor_point - ern_start))
     elif after.size:
-        boundaries = [max(1, anchor_point - max(1, int(after[0]) - anchor_point)), int(after[0])]
+        ern_end = int(after[0])
+        ern_start = max(1, anchor_point - max(1, ern_end - anchor_point))
     else:
-        boundaries = []
+        ern_start = max(1, anchor_point - 1)
+        ern_end = min(n_times - 1, anchor_point + 1)
 
-    boundaries = sorted({point for point in boundaries if 0 < point < n_times})
-    intervals = make_intervals_from_change_points(n_times, boundaries, names)
+    pre_duration = max(ern_end - ern_start, 1)
+    post_duration = max(ern_end - ern_start, 1)
+    pre_start = max(1, ern_start - pre_duration)
+    post_end = min(n_times - 1, ern_end + post_duration)
+
+    # Use neighboring Ho-RLSL points when available. If there are no extra
+    # neighbors, mirror the ERN duration so the displayed intervals have four
+    # explicit paper-style boundaries instead of using epoch endpoints.
+    extra_before = points[points < ern_start]
+    extra_after = points[points > ern_end]
+    if extra_before.size:
+        pre_start = int(extra_before[-1])
+    if extra_after.size:
+        post_end = int(extra_after[0])
+
+    interval_boundaries = [pre_start, ern_start, ern_end, post_end]
+    interval_boundaries = sorted({int(point) for point in interval_boundaries if 0 <= point < n_times})
+    if len(interval_boundaries) != 4:
+        intervals = make_intervals_from_change_points(n_times, [], names)
+        boundaries = []
+    else:
+        pre_start, ern_start, ern_end, post_end = interval_boundaries
+        intervals = {
+            names[0]: np.arange(pre_start, ern_start),
+            names[1]: np.arange(ern_start, ern_end),
+            names[2]: np.arange(ern_end, post_end),
+        }
+        boundaries = interval_boundaries
+    source_label = (
+        "connectivity-mode low-rank score"
+        if connectivity_metadata
+        else "Ho-RLSL update rule"
+    )
     method = (
-        "Ho-RLSL update rule paper-like intervals "
+        f"Ho-RLSL {source_label} paper-like intervals "
         f"({anchor_source}; anchor {times_ms[anchor_point]:.1f} ms)"
     )
     metadata = {
@@ -618,9 +765,12 @@ def make_paper_like_ho_rlsl_intervals(
         "anchor_source": anchor_source,
         "boundary_points": [int(point) for point in boundaries],
         "boundary_ms": [float(times_ms[point]) for point in boundaries],
+        "interval_boundary_points": [int(point) for point in boundaries],
+        "interval_boundary_ms": [float(times_ms[point]) for point in boundaries],
         "all_change_points": points.astype(int).tolist(),
         "all_change_points_ms": [float(times_ms[point]) for point in points],
         "target_window_ms": [float(target_window_ms[0]), float(target_window_ms[1])],
+        **connectivity_metadata,
     }
     return intervals, boundaries, metadata
 
@@ -953,12 +1103,15 @@ def smooth_trace(trace, window=7):
 
 def draw_interval_markers(ax, intervals, times_ms, condition_label):
     interval_list = list(intervals.values())
-    boundary_frames = [
-        int(frames[0])
-        for frames in interval_list[1:]
-    ]
-    for frame in boundary_frames:
-        ax.axvline(times_ms[frame], color="#7587ff", linewidth=1.5, alpha=0.85)
+    boundary_frames = []
+    for frames in interval_list:
+        if len(frames) > 0:
+            boundary_frames.append(int(frames[0]))
+    if interval_list and len(interval_list[-1]) > 0:
+        boundary_frames.append(int(interval_list[-1][-1]))
+    for frame in sorted(set(boundary_frames)):
+        if 0 <= frame < len(times_ms):
+            ax.axvline(times_ms[frame], color="#7587ff", linewidth=1.5, alpha=0.85)
 
     condition_upper = condition_label.upper()
     if condition_label == "incorrect":
@@ -1389,7 +1542,11 @@ def main():
     if ho_result is not None:
         intervals, change_points, paper_like_metadata = make_paper_like_ho_rlsl_intervals(
             n_times,
-            ho_result.change_points,
+            ho_result.raw_change_points if ho_result.raw_change_points else ho_result.change_points,
+            connectivity_tensor=X_clean,
+            connectivity_candidate_points=ho_result.change_score_times
+            if len(ho_result.change_score_times)
+            else ho_result.update_times,
         )
         change_point_method = paper_like_metadata["method"]
     else:

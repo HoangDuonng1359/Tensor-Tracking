@@ -722,9 +722,17 @@ def display_change_points_for_timecourse(change_point_tensor, low_rank_method, c
             n_times = change_point_tensor.shape[-1]
             points = saved["filtered_change_points"]
             points = points[(points >= 0) & (points < n_times)]
-            intervals, _, metadata = analysis.make_paper_like_ho_rlsl_intervals(n_times, points)
             raw_points = saved["raw_change_points"]
             raw_points = raw_points[(raw_points >= 0) & (raw_points < n_times)]
+            candidate_points = saved["change_score_times"]
+            if candidate_points.size == 0:
+                candidate_points = raw_points if raw_points.size >= 3 else points
+            intervals, _, metadata = analysis.make_paper_like_ho_rlsl_intervals(
+                n_times,
+                points,
+                connectivity_tensor=change_point_tensor,
+                connectivity_candidate_points=candidate_points,
+            )
             method = f"{metadata['method']} ({saved['sparse_solver']})"
             return (
                 intervals,
@@ -833,8 +841,15 @@ def get_interval_labels(condition, intervals):
 
 def draw_interval_labels(ax, intervals, times_ms, condition):
     interval_values = list(intervals.values())
-    for frames in interval_values[1:]:
-        ax.axvline(times_ms[frames[0]], color="#6075ff", linewidth=1.4, alpha=0.85)
+    boundary_frames = []
+    for frames in interval_values:
+        if len(frames) > 0:
+            boundary_frames.append(int(frames[0]))
+    if interval_values and len(interval_values[-1]) > 0:
+        boundary_frames.append(int(interval_values[-1][-1]))
+    for frame in sorted(set(boundary_frames)):
+        if 0 <= frame < len(times_ms):
+            ax.axvline(times_ms[frame], color="#6075ff", linewidth=1.4, alpha=0.85)
 
     labels = get_interval_labels(condition, intervals)
     label_frames = [
@@ -859,10 +874,18 @@ def draw_interval_labels(ax, intervals, times_ms, condition):
 
 
 def plot_timecourses(tensors, smooth_window, erp_traces=None, low_rank_method="Tucker low-rank"):
-    fig, axes = plt.subplots(len(tensors), 1, figsize=(11, 5.8), sharex=True)
+    displayed_tensors = {
+        condition: tensor
+        for condition, tensor in tensors.items()
+        if condition != "correct"
+    }
+    if not displayed_tensors:
+        displayed_tensors = tensors
+
+    fig, axes = plt.subplots(len(displayed_tensors), 1, figsize=(11, 3.6), sharex=True)
     axes = np.atleast_1d(axes)
 
-    for idx, (condition, X) in enumerate(tensors.items()):
+    for idx, (condition, X) in enumerate(displayed_tensors.items()):
         n_times = X.shape[-1]
         tensor_times_ms = frames_to_ms(n_times)
         condition_low_rank_method = low_rank_method
@@ -1228,7 +1251,7 @@ def saved_fcca_matches_current_intervals(results, low_rank_method):
     if method is None:
         return False
     method_text = str(np.asarray(method).item())
-    return method_text.startswith("Ho-RLSL update rule paper-like intervals")
+    return method_text.startswith("Ho-RLSL connectivity-mode low-rank score paper-like intervals")
 
 
 def main():
@@ -1294,7 +1317,7 @@ def main():
     tabs = st.tabs(["Time Course", "Interval Network", "Subject/Time Graph", "Data"])
 
     with tabs[0]:
-        st.subheader("Average ERN/CRN Waveform with Connectivity Change Points")
+        st.subheader("Average ERN Waveform with Connectivity Change Points")
         st.pyplot(
             plot_timecourses(tensors, smooth_window, erp_traces, low_rank_method=low_rank_method),
             clear_figure=True,
