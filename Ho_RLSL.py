@@ -131,8 +131,8 @@ class HoRLSLConfig:
     update subspace directions, and mark updates as change points.
 
     The paper recovers the sparse tensor from the orthogonally projected
-    measurement with GTCS-S. This module uses a tensor FISTA l1 solver by
-    default, with a proxy thresholding option for quick experiments.
+    measurement with GTCS-S. This module uses a practical OMP-style sparse
+    tensor pursuit by default, with FISTA and proxy options for experiments.
     """
 
     train_length: int = 10
@@ -1233,7 +1233,11 @@ if __name__ == "__main__":
     )
     parser.add_argument("--sparse-threshold", type=float, default=3.0)
     parser.add_argument("--sparse-threshold-mode", choices=["mad", "relative", "absolute"], default="mad")
-    parser.add_argument("--sparse-solver", choices=["fista", "fista_l1", "proxy", "gtcs_s_omp"], default="gtcs_s_omp")
+    parser.add_argument(
+        "--sparse-solver",
+        choices=["gtcs_s_omp"],
+        default="gtcs_s_omp",
+    )
     parser.add_argument("--lambda-sparse", type=float, default=None)
     parser.add_argument(
         "--epsilon",

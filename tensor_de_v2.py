@@ -79,7 +79,9 @@ RAW_BIDS_DIR_ALIASES = (
 )
 
 TUCKER_RANK = (10, 10, 10, 40)
-DEFAULT_HO_RLSL_MAX_RANKS = (10, 10, 10)
+DEFAULT_HO_RLSL_MAX_RANKS = (15, 15, 10)
+PAPER_LIKE_BOUNDARY_TARGET_WINDOW_MS = (-150.0, 150.0)
+PAPER_LIKE_BOUNDARY_ANCHOR_MS = 50.0
 
 # Detect two change points and split the time axis into three ERN phases.
 INTERVAL_NAMES = ("pre_ern", "ern", "post_ern")
@@ -133,7 +135,7 @@ def ho_rlsl_low_rank_decomposition(
     min_cp_distance_ms=50.0,
     score_smoothing_ms=25.0,
     threshold_k=3.0,
-    target_window_ms=(25.0, 75.0),
+    target_window_ms=PAPER_LIKE_BOUNDARY_TARGET_WINDOW_MS,
 ):
     if not HAS_HO_RLSL:
         raise RuntimeError("Ho_RLSL.py could not be imported.")
@@ -160,7 +162,7 @@ def ho_rlsl_low_rank_decomposition(
         mode_weights=(1.0, 1.0, 0.4),
         sampling_rate=1024.0,
         target_window_ms=target_window_ms,
-        target_anchor_ms=50.0,
+        target_anchor_ms=PAPER_LIKE_BOUNDARY_ANCHOR_MS,
     )
     result = HoRLSL(config).fit_transform_subject_first(X)
     return result.low_rank, result.sparse, result
@@ -580,8 +582,8 @@ def connectivity_change_scores(tensor, candidate_points, window=64):
 def select_connectivity_change_points(
     tensor,
     candidate_points,
-    target_window_ms=(25.0, 75.0),
-    anchor_ms=50.0,
+    target_window_ms=PAPER_LIKE_BOUNDARY_TARGET_WINDOW_MS,
+    anchor_ms=PAPER_LIKE_BOUNDARY_ANCHOR_MS,
     score_window=64,
     start_ms=-1000.0,
     end_ms=1000.0,
@@ -600,8 +602,17 @@ def select_connectivity_change_points(
     in_target = (times_ms[points] >= target_window_ms[0]) & (times_ms[points] <= target_window_ms[1])
     if np.any(in_target):
         target_indices = np.flatnonzero(in_target)
-        anchor_idx = int(target_indices[np.argmax(scores[target_indices])])
-        selection = "highest connectivity score in target window"
+        anchor_idx = int(
+            target_indices[
+                np.lexsort(
+                    (
+                        -scores[target_indices],
+                        np.abs(times_ms[points[target_indices]] - anchor_ms),
+                    )
+                )[0]
+            ]
+        )
+        selection = "closest connectivity candidate to target anchor"
     else:
         anchor_idx = int(np.argmin(np.abs(times_ms[points] - anchor_ms)))
         selection = "closest connectivity candidate to target center fallback"
@@ -651,8 +662,8 @@ def make_paper_like_ho_rlsl_intervals(
     connectivity_tensor=None,
     connectivity_candidate_points=None,
     names=INTERVAL_NAMES,
-    target_window_ms=(25.0, 75.0),
-    anchor_ms=50.0,
+    target_window_ms=PAPER_LIKE_BOUNDARY_TARGET_WINDOW_MS,
+    anchor_ms=PAPER_LIKE_BOUNDARY_ANCHOR_MS,
     start_ms=-1000.0,
     end_ms=1000.0,
 ):
@@ -1455,8 +1466,12 @@ def parse_args():
     parser.add_argument("--ho-train-length", type=int, default=10)
     parser.add_argument("--ho-alpha", type=int, default=8)
     parser.add_argument("--ho-sigma-min", type=float, default=0.11)
-    parser.add_argument("--ho-max-ranks", default="10,10,10")
-    parser.add_argument("--ho-sparse-solver", choices=["fista", "fista_l1", "proxy", "gtcs_s_omp"], default="gtcs_s_omp")
+    parser.add_argument("--ho-max-ranks", default="15,15,10")
+    parser.add_argument(
+        "--ho-sparse-solver",
+        choices=["gtcs_s_omp"],
+        default="gtcs_s_omp",
+    )
     parser.add_argument("--ho-fista-max-iter", type=int, default=20)
     parser.add_argument("--ho-sparsity", type=int, default=8)
     parser.add_argument("--ho-residual-tol", type=float, default=1e-3)
