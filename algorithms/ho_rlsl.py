@@ -50,11 +50,12 @@ class HORLSLRunner:
       u, s_vals, _ = np.linalg.svd(unfolded, full_matrices=False)
       print(f"Mode {mode} training top 10 singular values: {s_vals[:10]}")
       
+      mode_max_rank = self.config.max_rank[mode] if isinstance(self.config.max_rank, (list, tuple)) else self.config.max_rank
       basis, threshold = truncated_basis(
         unfolded,
         sigma_min=self.config.sigma_min,
         sigma_scale=self.config.sigma_scale,
-        max_rank=self.config.max_rank,
+        max_rank=mode_max_rank,
       )
       bases.append(basis)
       correlations.append(R)
@@ -76,38 +77,6 @@ class HORLSLRunner:
 
   def run(self, stream: np.ndarray) -> DecompositionResult:
     n_times = stream.shape[0]
-    
-    def delete_direction(data: np.ndarray, P: np.ndarray, sigma_min: float) -> np.ndarray:
-        if P.shape[1] == 0: return P
-        w = data.shape[1]
-        lambdas = np.diag((P.T @ data) @ (P.T @ data).T) / w
-        keep_idx = np.where(lambdas >= sigma_min)[0]
-        if len(keep_idx) == 0: return P[:, :1]
-        return P[:, keep_idx]
-
-    def add_direction(data: np.ndarray, P: np.ndarray, sigma_min: float, max_rank: int) -> np.ndarray:
-        w = data.shape[1]
-        proj_matrix = np.eye(P.shape[0]) - P @ P.T
-        D_proj = proj_matrix @ data
-        cov = (D_proj @ D_proj.T) / w
-        evals, evecs = np.linalg.eigh(cov)
-        idx = np.argsort(evals)[::-1]
-        evals, evecs = evals[idx], evecs[:, idx]
-        
-        if data.shape[1] > 0:
-            print(f"  Residual evals (top 5): {evals[:5]}")
-            
-        add_idx = np.where(evals > sigma_min)[0]
-        if len(add_idx) == 0:
-            return P
-            
-        new_directions = evecs[:, add_idx]
-        combined = np.hstack([P, new_directions])
-        # Paper-aligned strict rank cap (Stage 4)
-        limit = min(max_rank, P.shape[0] - 1) if max_rank is not None else P.shape[0] - 1
-        if combined.shape[1] > limit:
-            combined = combined[:, :limit]
-        return combined
 
     bases, _, thresholds, _, _ = self._initial_bases(stream)
     
@@ -148,21 +117,28 @@ class HORLSLRunner:
               
               for mode in range(len(bases)):
                   unfolded_window = concatenate_mode_unfoldings(window_data, mode)
-                  rank_before = bases[mode].shape[1]
+                  old_basis = bases[mode].copy()
                   
                   sig_min = self.config.sigma_min if self.config.sigma_min is not None else float(thresholds[mode])
                   # Step 1: Delete Direction
                   bases[mode] = delete_direction(unfolded_window, bases[mode], sig_min)
                   # Step 2: Add Direction
-                  bases[mode] = add_direction(unfolded_window, bases[mode], sig_min, self.config.max_rank)
+                  mode_max_rank = self.config.max_rank[mode] if isinstance(self.config.max_rank, (list, tuple)) else self.config.max_rank
+                  bases[mode] = add_direction(unfolded_window, bases[mode], sig_min, mode_max_rank)
                   
-                  rank_after = bases[mode].shape[1]
-                  if rank_after != rank_before:
+                  # Projection distance metric instead of np.allclose
+                  P_old = old_basis @ old_basis.T
+                  P_new = bases[mode] @ bases[mode].T
+                  dist = np.linalg.norm(P_old - P_new, ord="fro") / np.sqrt(2)
+                  
+                  if dist > getattr(self.config, 'delta_subspace', 0.15):
                       subspace_changed = True
               
               if subspace_changed:
-                  change_points.append(t)
-                  t_j = t + 1  # Reset anchor to the first sample of the next window (Stage 2)
+                  min_cp_dist = getattr(self.config, 'min_cp_distance', 13)
+                  if len(change_points) == 0 or t - change_points[-1] >= min_cp_dist:
+                      change_points.append(t)
+                      t_j = t + 1  # Reset anchor to the first sample of the next window (Stage 2)
 
       lowrank_stream[t] = L_t.astype(np.float32)
       sparse_stream[t] = S_t.astype(np.float32)
@@ -194,10 +170,12 @@ def default_config_for_condition() -> DecompositionConfig:
     train_steps=10,    
     alpha=8,           
     sigma_min=0.11,    
-    max_rank=4,        
-    lambda_sparse=0.1, 
+    max_rank=(4, 4, 6),        
+    lambda_sparse=0.2, 
     symmetric_modes=True,
     name="eeg_research_standard",
+    delta_subspace=0.15,
+    min_cp_distance=13,
   )
 
 

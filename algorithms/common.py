@@ -19,10 +19,12 @@ class DecompositionConfig:
   sigma_min: float | None = None
   sigma_scale: float = 0.1
   lambda_sparse: float = 0.05
-  max_rank: int | None = None
+  max_rank: Any = None
   symmetric_modes: bool = True
   name: str = "default"
   recovery_mode: str = "pgd"
+  delta_subspace: float = 0.15
+  min_cp_distance: int = 13
 
 
 @dataclass
