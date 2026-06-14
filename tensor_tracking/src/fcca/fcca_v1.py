@@ -55,7 +55,7 @@ class Config:
     kRange: tuple[int, ...] = (2, 3, 4, 5, 6)
     selectionCriterion: str = "U"
     requestedK: Any = None
-    minCommunitySize: int = 3
+    minCommunitySize: int = 1
     maxPlotEdges: int = 35
     isolatedNodeColor: tuple[float, float, float] = (0.72, 0.72, 0.72)
     maxGraphsPerInterval: float = math.inf
