@@ -1460,11 +1460,11 @@ def save_paper_like_report(report, output_path=HO_RLSL_PAPER_LIKE_REPORT_FILE):
 def parse_args():
     parser = argparse.ArgumentParser(description="Run tensor low-rank denoising and interval FCCA analysis.")
     parser.add_argument("--input", type=Path, default=INPUT_FILE)
-    parser.add_argument("--low-rank-method", choices=["tucker", "ho-rlsl"], default="tucker")
-    parser.add_argument("--skip-timecourse", action="store_true")
-    parser.add_argument("--save-ho-rlsl-tensors", action="store_true")
-    parser.add_argument("--ho-train-length", type=int, default=10)
-    parser.add_argument("--ho-alpha", type=int, default=8)
+    parser.add_argument("--low-rank-method", choices=["tucker", "ho-rlsl"], default="ho-rlsl")
+    parser.add_argument("--skip-timecourse", action="store_true", default=True)
+    parser.add_argument("--save-ho-rlsl-tensors", action="store_true", default=True)
+    parser.add_argument("--ho-train-length", type=int, default=80)
+    parser.add_argument("--ho-alpha", type=int, default=64)
     parser.add_argument("--ho-sigma-min", type=float, default=0.11)
     parser.add_argument("--ho-max-ranks", default="15,15,10")
     parser.add_argument(
