@@ -50,12 +50,12 @@ OUTPUT_DIR_NAME = "../../outputs/fcca_paper_visualizations"
 class Config:
     sampleRateHz: float = 1024.0
     epochStartMs: float = -1000.0
-    analysisWindowMs: tuple[float, float] = (-800.0, 800.0)
-    preStartMs: float = -800.0
+    analysisWindowMs: tuple[float, float] = (-900.0, 900.0)
+    preStartMs: float = -900.0
     kRange: tuple[int, ...] = (2, 3, 4, 5, 6)
     selectionCriterion: str = "U"
     requestedK: Any = None
-    minCommunitySize: int = 2
+    minCommunitySize: int = 3
     maxPlotEdges: int = 35
     isolatedNodeColor: tuple[float, float, float] = (0.72, 0.72, 0.72)
     maxGraphsPerInterval: float = math.inf
@@ -156,7 +156,6 @@ def cluster_ern_fcca_paper(k_input: Any = None) -> dict[str, Any]:
 
     print(f"Tensor: {n_subjects} subjects x {n_nodes} nodes x {n_nodes} nodes x {n_frames} frames")
     print(f"Analysis window: {cfg.analysisWindowMs[0]:.1f} to {cfg.analysisWindowMs[1]:.1f} ms")
-    print(f"Pre-ERN starts at {cfg.preStartMs:.1f} ms")
     if INTERVAL_BOUNDARY_FRAMES_0BASED is not None:
         print(f"Manual interval boundaries, 0-based: {mat2str(INTERVAL_BOUNDARY_FRAMES_0BASED)}")
     print(f"Change points used: {mat2str(change_points)}")
@@ -430,6 +429,9 @@ def choose_change_points_from_metadata(
 
     cp = np.rint(np.asarray(cp, dtype=float).reshape(-1)).astype(int)
     cp = stable_unique(cp[(cp > 0) & (cp < n_frames)])
+
+    if cp.size >= 4:
+        return cp[:4].astype(int)
 
     analysis_frames = np.where(
         (times_ms >= analysis_window_ms[0]) & (times_ms <= analysis_window_ms[1])
