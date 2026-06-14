@@ -40,8 +40,9 @@ DEFAULT_K_INPUT: list[int] | int = []
 # INPUT DU LIEU - chi can sua dong nay khi muon doi file dau vao.
 INPUT_DATA_FILE: str | None = "../../outputs/ho_rlsl_v1_results.npz"
 
-# Frame goc 0-based trong file .npz. 4 moc nay tao 3 khoang lien tiep.
-INTERVAL_BOUNDARY_FRAMES_0BASED: tuple[int, int, int, int] | None = (205, 974, 1166, 1742)
+# 0-based frame boundaries from ho_rlsl_v1_results.npz:
+# 143=-860.4 ms, 975=-47.9 ms, 1167=139.6 ms, 1615=577.1 ms.
+INTERVAL_BOUNDARY_FRAMES_0BASED: tuple[int, int, int, int] | None = (143, 975, 1167, 1615)
 
 OUTPUT_DIR_NAME = "../../outputs/fcca_paper_visualizations"
 
@@ -480,8 +481,8 @@ def make_interval_specs(
             raise ValueError(f"Invalid interval boundaries {mat2str(cp)} for {n_frames} frames.")
         frame_sets = [
             np.arange(cp[0], cp[1] + 1, dtype=int),
-            np.arange(cp[1] + 1, cp[2] + 1, dtype=int),
-            np.arange(cp[2] + 1, cp[3] + 1, dtype=int),
+            np.arange(cp[1], cp[2] + 1, dtype=int),
+            np.arange(cp[2], cp[3] + 1, dtype=int),
         ]
         return interval_specs_from_frame_sets(names, display_names, frame_sets, times_ms)
 
