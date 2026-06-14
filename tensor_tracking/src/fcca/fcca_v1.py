@@ -41,7 +41,7 @@ DEFAULT_K_INPUT: list[int] | int = []
 INPUT_DATA_FILE: str | None = "../../outputs/ho_rlsl_v1_results.npz"
 
 # Frame goc 0-based trong file .npz. 4 moc nay tao 3 khoang lien tiep.
-INTERVAL_BOUNDARY_FRAMES_0BASED: tuple[int, int, int, int] | None = None
+INTERVAL_BOUNDARY_FRAMES_0BASED: tuple[int, int, int, int] | None = (205, 974, 1166, 1742)
 
 OUTPUT_DIR_NAME = "../../outputs/fcca_paper_visualizations"
 
